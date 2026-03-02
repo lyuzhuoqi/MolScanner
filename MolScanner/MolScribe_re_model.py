@@ -551,7 +551,7 @@ class MoleculeDataset(Dataset):
         self.geo_transforms_list = []
         if self.geo_augment:
             self.geo_transforms_list += [
-                A.Affine(rotate=(-90, 90), fit_output=True, fill=255, p=1.0),
+                A.Affine(rotate=(-90, 90), fit_output=True, fill=255, p=0.5),
                 CropWhiteTrain(pad=5, p=1.0),  # Trim white corners from rotation before further augmentation
                 A.RandomCropFromBorders(crop_left=0.01, crop_right=0.01, crop_top=0.01, crop_bottom=0.01, p=0.5),
                 A.CropAndPad(percent=(0.0, 0.4), sample_independently=True, keep_size=False, fill=255, fill_mask=255, p=0.2),
