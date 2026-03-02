@@ -1,0 +1,405 @@
+from tqdm import tqdm
+from pathlib import Path
+import argparse
+import tarfile
+import concurrent.futures
+import numpy as np
+import cv2
+from pymupdf import Document
+import re
+import io
+import os
+import concurrent.futures
+from PIL import Image
+import pytesseract
+
+def ocr_page(page_data):
+    """
+    OCR function that works with ProcessPoolExecutor.
+    Takes serialized image data.
+    """
+    page_index, img_bytes = page_data
+    try:
+        img = Image.open(io.BytesIO(img_bytes))
+        text = pytesseract.image_to_string(img)
+        return page_index, text
+    except Exception as e:
+        print(f"OCR error on page {page_index}: {e}")
+        return page_index, ""
+
+def extract_claim_pages(doc, dpi=300, workers=4):
+    """
+    Locate pages containing the "Claims" section in a scanned PDF using OCR.
+    """
+    if doc.page_count == 0:
+        return [], ""
+
+    start_patterns = [
+    # Pattern 1: "What..." variations
+    r"\bwhat\s+(?:(?:is|are)\s+(?:claim(?:ed|s)?\s+is|claim(?:ed)?)|we\s+claim\s+is)\s*:?",
+
+    # Pattern 2: "The..." phrases - comprehensive coverage
+    # Covers multiple structures:
+    # - "The invention claimed is" / "The claimed invention is:"
+    # - "The invention is claimed as follows:"
+    # - "The claims defining the invention are as follows:"
+    # - "The following claims:"
+    r"\bthe\s+(?:(?:claimed\s+)?invention\s+(?:claimed\s+is|is\s+claimed\s+as\s+follows|is)|claims\s+defining\s+the\s+invention\s+are\s+as\s+follows|following\s+claims?)\s*:?",
+
+    # Pattern 3: "That which..." phrases
+    r"\bthat\s+which\s+is\s+claimed(?:\s+is)?\s*:?",
+
+    # Pattern 4: First-person and impersonal claims
+    r"\b(?:i\s+claim(?:ed)?|we\s+claim(?:ed)?|it\s+is\s+claimed|we\s+claim\s+as\s+our\s+invention)\s*:",
+]
+    compiled_patterns = [re.compile(p, re.IGNORECASE | re.MULTILINE) for p in start_patterns]
+    ocr_texts = [""] * doc.page_count
+
+    # Pre-serialize pages for ProcessPoolExecutor
+    page_data_list = []
+    for i in range(doc.page_count):
+        page = doc.load_page(i)
+        pix = page.get_pixmap(dpi=dpi, alpha=False)
+        img_bytes = pix.tobytes("png")
+        page_data_list.append((i, img_bytes))
+
+    # PHASE 1: Perform OCR on all pages in parallel
+    with concurrent.futures.ProcessPoolExecutor(max_workers=min(os.cpu_count(), len(page_data_list), workers)) as executor:
+        futures = {executor.submit(ocr_page, p): p[0] for p in page_data_list}
+
+        for future in concurrent.futures.as_completed(futures):
+            page_index, text = future.result()
+            ocr_texts[page_index] = text
+
+    # PHASE 2: Sequentially search the results to find the *first* page that matches
+    start_page = -1
+    for i, text in enumerate(ocr_texts):
+        if any(pat.search(text.lower()) for pat in compiled_patterns):
+            start_page = i
+            break  # Found the first one, stop looking
+
+    if start_page == -1:
+        return [], ""
+
+    claim_pages_indices = list(range(start_page, len(ocr_texts)))
+    claims_text = "\n".join(ocr_texts[start_page:])
+    return claim_pages_indices, claims_text
+
+def _detect_backbones(page_data):
+    """
+    Helper function that works with ProcessPoolExecutor.
+    Takes serialized image data and checks for chemical backbones.
+    """
+    img_bytes = page_data
+    np_arr = np.frombuffer(img_bytes, np.uint8)
+    original_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    gray_image = cv2.cvtColor(original_image, cv2.COLOR_BGR2GRAY)
+    binary_image = cv2.adaptiveThreshold(
+        gray_image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 11, 2
+    )
+
+    # --- 2. Remove Table Lines ---
+    # This step explicitly finds and removes long horizontal and vertical lines.
+    no_tables_mask = binary_image.copy()
+    
+    # Define kernels for horizontal and vertical line detection
+    # The length (e.g., 50) should be adjusted based on the expected minimum
+    # length of a table line in your documents.
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (50, 1))
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 50))
+    
+    # Detect horizontal lines
+    detected_horizontal = cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
+    # Detect vertical lines
+    detected_vertical = cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
+    
+    # Combine detected lines into a single mask and remove them from the image
+    table_lines_mask = detected_horizontal + detected_vertical
+    no_tables_mask = cv2.subtract(no_tables_mask, table_lines_mask)
+    # --- 3. Filter Main Texts to Keep Potential Rings and Chains ---
+    # Now run the component analysis on the table-free image
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(no_tables_mask, 4, cv2.CV_32S)
+
+    filtered_mask = np.zeros_like(no_tables_mask)
+    
+    MIN_AREA_NOISE = 15
+    MAX_CHAR_HEIGHT = 40
+    MIN_CHAR_HEIGHT = 5
+    MAX_ASPECT_RATIO = 5
+    MIN_ASPECT_RATIO = 0.1
+    MIN_SOLIDITY = 0.25
+
+    for i in range(1, num_labels):
+        x, y, w, h, area = stats[i]
+
+        if area < MIN_AREA_NOISE:
+            continue
+        
+        aspect_ratio = w / float(h)
+        component_mask = (labels == i).astype("uint8") * 255
+        contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if len(contours) == 0: continue
+            
+        contour = contours[0]
+        hull = cv2.convexHull(contour)
+        hull_area = cv2.contourArea(hull)
+        solidity = area / float(hull_area) if hull_area > 0 else 0
+
+        is_text_like = (
+            MIN_CHAR_HEIGHT < h < MAX_CHAR_HEIGHT and
+            MIN_ASPECT_RATIO < aspect_ratio < MAX_ASPECT_RATIO and
+            solidity > MIN_SOLIDITY
+        )
+
+        if not is_text_like:
+            filtered_mask[component_mask == 255] = 255
+
+    # --- 4. Region Grouping ---
+    kernel = np.ones((3, 3), np.uint8)
+    dilated_mask = cv2.dilate(filtered_mask, kernel, iterations=3)
+    contours, _ = cv2.findContours(dilated_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    output_image = original_image.copy()
+    detected_regions = 0
+
+    # --- 5. Line and Corner Detection to Verify Structures ---
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        if w < 50 or h < 50: continue
+
+        # Use the original binary image (not the table-free one) for ROI analysis
+        # to ensure bonds that were close to table lines are still detected correctly.
+        roi = binary_image[y:y+h, x:x+w]
+        
+        lines = cv2.HoughLinesP(roi, 1, np.pi / 180, threshold=20, minLineLength=10, maxLineGap=5)
+        num_lines = len(lines) if lines is not None else 0
+
+        corners = cv2.goodFeaturesToTrack(roi, maxCorners=100, qualityLevel=0.01, minDistance=10)
+        num_corners = len(corners) if corners is not None else 0
+        
+        # Additional check: A real chemical structure should not be excessively wide or tall.
+        # This helps filter out any remaining border-like artifacts.
+        roi_aspect_ratio = w / float(h)
+        if roi_aspect_ratio > 10 or roi_aspect_ratio < 0.1:
+            continue
+
+        if num_lines > 10 and num_corners > 10:
+            detected_regions += 1
+            cv2.rectangle(output_image, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+    if detected_regions > 0:
+        return True
+    else:
+        return False
+
+def pdf_contains_backbones_on_pages(doc, page_indices, dpi=150, workers=4):
+    """
+    Checks for chemical backbones (rings or chains) on specified pages of a PDF document.
+    
+    Args:
+        doc: The PDF document object (e.g., from fitz.open()).
+        page_indices (list): A list of 0-based page indices to check.
+        dpi (int): The resolution for rendering the PDF pages. 150 is a good balance.
+        workers (int): The number of parallel processes to use.
+    
+    Returns:
+        bool: True if a backbone is found on any of the specified pages, False otherwise.
+    """
+    page_data_list = []
+    for i in page_indices:
+        page = doc.load_page(i)
+        pix = page.get_pixmap(dpi=dpi, alpha=False)
+        img_bytes = pix.tobytes("png")
+        page_data_list.append(img_bytes)
+
+    if not page_data_list:
+        return False
+
+    found = False
+    # Use a number of workers that makes sense for the task
+    num_workers = min(os.cpu_count() or 1, len(page_data_list), workers)
+    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+        # Submit all pages to be processed
+        futures = {executor.submit(_detect_backbones, p) for p in page_data_list}
+        for future in concurrent.futures.as_completed(futures):
+            if future.result():
+                found = True
+                # Once one is found, we can stop all other pending jobs
+                executor.shutdown(wait=False, cancel_futures=True)
+                break
+    return found
+
+def text_hints_markush(claims_text):
+    """
+    Return True if text contains R-group placeholders and one of several
+    definition patterns indicating a Markush structure.
+    """
+    # Common R-group placeholders: R, R1, R2, etc.
+    placeholder_patterns = [
+        r"\bR\d*\b",                  # R or R1, R12...
+        r"\bR-group\b",               # "R-group"
+        r"\bR group\b",               # "R group"
+        r"\bR\(\d+\)\b",              # R(1), R(2) in some specs
+    ]
+
+    # Definition patterns: different ways to express Markush lists or ranges
+    definition_patterns = [
+        r"selected from the group consisting(?: essentially of)?",  # standard
+        r"selected from the group comprising",                      # comprising variant
+        r"selected from(?: a group)? of",                           # shorter form
+        r"wherein\s+R\d?",                                          # wherein R1 is …
+        r"wherein said substituents\s+are",                         # alternative wording
+        r"\bR\d?\s*to\s*R\d?\b",                                    # R1 to R5
+        r"each R\d?\s*is\s*(?:a\s*)?[A-Za-z0-9,\- ]+",              # each R is …
+        r"group consisting essentially of",                         # essential variant
+    ]
+
+    # Check for any placeholder
+    has_placeholder = any(
+        re.search(pat, claims_text, flags=re.IGNORECASE)
+        for pat in placeholder_patterns
+    )
+
+    # Check for any definition phrase
+    has_definition = any(
+        re.search(pat, claims_text, flags=re.IGNORECASE)
+        for pat in definition_patterns
+    )
+
+    return bool(has_placeholder and has_definition)
+
+def save_claims_pdf(doc, pages, out_path):
+    """
+    Extracts the specified pages from a Document and writes them to out_path.
+    """
+    if not pages:
+        return
+    with Document() as dst:
+        dst.insert_pdf(doc, from_page=min(pages), to_page=max(pages))
+        dst.save(out_path)
+
+import tempfile
+from contextlib import contextmanager
+import shutil
+
+@contextmanager
+def temp_extraction_dir(prefix='patents_'):
+    """Context manager that ensures cleanup even on interruption"""
+    temp_dir = tempfile.mkdtemp(prefix=prefix)
+    try:
+        yield temp_dir
+    finally:
+        if os.path.exists(temp_dir):
+            print(f"Cleaning up temp directory: {temp_dir}")
+            shutil.rmtree(temp_dir)
+
+def extract_valid_pdfs(tar_file, temp_dir, valid_patent_no):
+    """Extract only PDFs with valid patent numbers"""
+    extracted_files = []
+    
+    with tarfile.open(tar_file, 'r') as tar:
+        # Get all PDF members
+        pdf_members = [m for m in tar.getmembers() 
+                      if m.isfile() and m.name.lower().endswith('.pdf')]
+        
+        for member in pdf_members:
+            patent_no = Path(member.name).stem
+            if patent_no in valid_patent_no:
+                # Extract this specific file
+                tar.extract(member, temp_dir)
+                extracted_files.append(Path(temp_dir) / member.name)
+    
+    return extracted_files
+
+def main(year: int, workers: int):
+    home = Path.home()
+    data_path = home / "projects/Markush/data"
+    patent_no_file_path = data_path / "drug_patent_no.txt"
+    with open(patent_no_file_path, 'r') as f:
+        valid_patent_no = set(line.strip() for line in f.readlines())
+    print(f"CPU cores available: {os.cpu_count()}")
+    Path.mkdir(data_path / f'{year}/claims', parents=True, exist_ok=True)
+    tar_files = list((data_path / str(year)).glob("*.tar"))
+    # tar_files = list((data_path / str(year)).glob("grant_pdf_20240102.tar"))
+    tar_file_counter = 1
+
+    no_claims_file = data_path / f'{year}/patents_wo_claims.txt' # File to store patent numbers with no claims
+    
+    for tar_file in tar_files:
+        with temp_extraction_dir() as temp_dir:
+            # Extract only valid PDFs
+            pdf_files = extract_valid_pdfs(tar_file, temp_dir, valid_patent_no)
+            if not pdf_files:
+                print(f"No valid patents found in {tar_file.name}")
+                continue
+
+            saved_counter = 0
+            no_backbone_counter = 0
+            no_claims_counter = 0
+            no_sub_counter = 0
+            pbar = tqdm(pdf_files, total=len(pdf_files), desc=f"{tar_file.name}", unit="file")
+            pbar.set_postfix(saved_claims=saved_counter, 
+                            tar_files=f'{tar_file_counter}/{len(tar_files)}',
+                            no_backbone=no_backbone_counter,
+                            no_claims=no_claims_counter,
+                            no_sub=no_sub_counter)
+            
+            for pdf_path in pbar:
+                patent_no = pdf_path.stem
+                doc = Document(str(pdf_path))
+
+                # 1. Extract claims using OCR (find claim pages)
+                pages, claims_text = extract_claim_pages(doc, workers=workers, dpi=150)
+                
+                if not pages:
+                    no_claims_counter += 1
+                    # Write patent number to file
+                    with open(no_claims_file, 'a') as f:
+                        f.write(f"{patent_no}\n")
+                    pbar.set_postfix(saved_claims=saved_counter, 
+                                    tar_files=f'{tar_file_counter}/{len(tar_files)}',
+                                    no_backbone=no_backbone_counter,
+                                    no_claims=no_claims_counter,
+                                    no_sub=no_sub_counter)
+                    doc.close()
+                    continue
+
+                # 2. Final check with text heuristics and save
+                text_flag = text_hints_markush(claims_text)
+                if not text_flag:
+                    no_sub_counter += 1
+
+                # 3. Fast CV detection ONLY on claim pages
+                claim_pages_have_rings = pdf_contains_backbones_on_pages(doc, pages, workers=workers, dpi=150)
+                
+                if claim_pages_have_rings:
+                    out_pdf = data_path / f'{year}/claims/{patent_no}.pdf'
+                    save_claims_pdf(doc, pages, out_pdf)
+                    saved_counter += 1
+                else:
+                    no_backbone_counter += 1
+                    pbar.set_postfix(saved_claims=saved_counter, 
+                                    tar_files=f'{tar_file_counter}/{len(tar_files)}',
+                                    no_backbone=no_backbone_counter,
+                                    no_claims=no_claims_counter,
+                                    no_sub=no_sub_counter)
+                    doc.close()
+                    continue
+
+                doc.close()
+                pbar.set_postfix(saved_claims=saved_counter,
+                                 tar_files=f'{tar_file_counter}/{len(tar_files)}',
+                                 no_backbone=no_backbone_counter,
+                                 no_claims=no_claims_counter,
+                                 no_sub=no_sub_counter)
+            
+        tar_file_counter += 1
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Extract claim sections from patent PDFs which contains Markush structure.")
+    parser.add_argument("--year", type=int, required=True, help="Year of the patents to process.")
+    parser.add_argument("--workers", type=int, default=4, help="Number of worker threads for parallel processing.")
+    args = parser.parse_args()
+    main(args.year, args.workers)
