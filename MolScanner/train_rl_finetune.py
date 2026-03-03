@@ -113,10 +113,10 @@ if __name__ == '__main__':
         # ===== RL hyperparameters =====
         alpha_rl_max=1,          # max RL weight after warmup
         alpha_rl_warmup_epochs=0, # linearly anneal alpha from 0 → max over N epochs
-        rl_every_n_steps=1,      # compute RL loss every N MLE steps (cost control)
+        rl_every_n_steps=5,      # compute RL loss every N MLE steps (cost control)
         rl_max_len=500,          # max decode length for RL sampling (match pretraining)
         rl_temperature=0.8,      # sampling temperature (lower = less noisy)
-        rl_n_samples=8,          # samples per image (set >1 for self-critical baseline)
+        rl_n_samples=4,          # samples per image (set >1 for self-critical baseline)
         rl_subsample=32,         # max images per batch for RL sampling (memory cap)
 
         # resume

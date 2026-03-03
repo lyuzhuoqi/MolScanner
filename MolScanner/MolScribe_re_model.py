@@ -3019,15 +3019,33 @@ def compute_reinforce_tanimoto_loss(
             sampled_seqs_list.append(seq)
 
     # ===== Phase 2: Compute Tanimoto rewards (CPU, non-differentiable) =====
+    # Canonicalize GT SMILES: remove atom mapping + functional group handling
+    gt_canonical = []
+    for s in gt_expanded:
+        try:
+            s_clean = remove_atom_mapping(s)
+            # Also apply functional group replacement + expansion for GT
+            s_clean, mappings = _replace_functional_group(s_clean)
+            mol_tmp = Chem.MolFromSmiles(s_clean, sanitize=False)
+            if mol_tmp is not None:
+                s_clean, mol_tmp = _expand_functional_group(mol_tmp, mappings)
+            can, ok = canonicalize_smiles(s_clean, ignore_cistrans=True)
+            gt_canonical.append(can if ok and can else s)
+        except Exception:
+            gt_canonical.append(s)
+
     rewards = torch.zeros(total_seqs, device=device)
     sampled_smiles = []
     n_valid = 0
 
     for b in range(total_seqs):
         result = vocab.sequence_to_smiles(sampled_seqs_list[b])
-        pred_smiles = result.get('smiles', '')
+        # Apply postprocessing to predicted SMILES (same as _result_to_smiles_postprocess)
+        pred_smiles = _result_to_smiles_postprocess(result)
+        if pred_smiles is None:
+            pred_smiles = ''
         sampled_smiles.append(pred_smiles)
-        tanimoto = compute_tanimoto_similarity(pred_smiles, gt_expanded[b])
+        tanimoto = compute_tanimoto_similarity(pred_smiles, gt_canonical[b])
         rewards[b] = tanimoto
         if tanimoto > 0:
             n_valid += 1
