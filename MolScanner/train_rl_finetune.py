@@ -111,7 +111,7 @@ if __name__ == '__main__':
         bond_loss_weight=1.0,    # weight for bond CE loss
 
         # ===== RL hyperparameters =====
-        alpha_rl_max=1,          # max RL weight after warmup
+        alpha_rl_max=0.5,          # max RL weight after warmup
         alpha_rl_warmup_epochs=0, # linearly anneal alpha from 0 → max over N epochs
         rl_every_n_steps=5,      # compute RL loss every N MLE steps (cost control)
         rl_max_len=500,          # max decode length for RL sampling (match pretraining)
