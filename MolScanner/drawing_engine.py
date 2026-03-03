@@ -518,7 +518,7 @@ def generate_image_from_smiles(smiles, n_bins=None,
         success = True
     except Exception:
         if debug:
-            raise Exception
+            raise
         img = _blank_image()
         graph = {}
         success = False
@@ -614,7 +614,7 @@ def generate_image_from_graph(graph,
         success = True
     except Exception:
         if debug:
-            raise Exception
+            raise
         img = _blank_image()
         success = False
     return img, style_config, mol_config, success

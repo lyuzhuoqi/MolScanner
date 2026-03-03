@@ -39,7 +39,7 @@ if __name__ == '__main__':
     # ===== Resume from pretrained checkpoint (set to None for training from scratch) =====
     # Example: resume a pretrained MolScribe_re model for RL fine-tuning:
     #   resume_path = str(project_dir / "MolScanner" / "models" / "MolScanner" / "best.pth")
-    resume_path = str(project_dir / "MolScanner" / "models" / "MolScribe_re" /'20260213_reimplemented_MolScribe' / "best.pth")
+    resume_path = str(project_dir / "MolScanner" / "models" / "MolScribe_re" / "20260226_edge_padding_finished.pth")
     
     train(
         # sample
@@ -48,7 +48,7 @@ if __name__ == '__main__':
         
         # training
         save_path=str(log_dir),
-        num_epochs=2 if FAST_TEST else 30,
+        num_epochs=2 if FAST_TEST else 10,
         # NOTE: batch_size is PER-GPU now!
         # With 4 GPUs: effective_batch = 64 * 4 = 256
         batch_size=64,
@@ -56,7 +56,7 @@ if __name__ == '__main__':
         decoder_lr=1e-4,
         weight_decay=1e-6,
         warmup_ratio=0.02,
-        early_stopping_patience=30,
+        early_stopping_patience=10,
         # NOTE: num_workers is PER-PROCESS (each GPU has its own DataLoader)
         # 8 workers * 4 processes = 32 total
         num_workers=4 if FAST_TEST else 8,
