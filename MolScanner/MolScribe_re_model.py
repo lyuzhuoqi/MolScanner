@@ -318,14 +318,16 @@ class MolScannerVocab:
                 else:
                     i = j
 
-            # --- Regular atom (uppercase letter, possibly followed by lowercase for Cl/Br) ---
-            elif token_str.isalpha() and token_str.isupper():
+            # --- Regular atom (uppercase letter, or lowercase aromatic atom) ---
+            elif token_str.isalpha():
                 j = i + 1
-                # Check for two-letter atoms: Cl, Br
+                # Check for two-letter atoms: Cl, Br (uppercase), se, te (aromatic)
                 if (j < len(sequence) and self.is_symbol(sequence[j])):
                     next_ch = self.idx2token.get(sequence[j], '')
                     if ((token_str == 'C' and next_ch == 'l')
-                            or (token_str == 'B' and next_ch == 'r')):
+                            or (token_str == 'B' and next_ch == 'r')
+                            or (token_str == 's' and next_ch == 'e')
+                            or (token_str == 't' and next_ch == 'e')):
                         j = i + 2
                 atom_token = ''.join(self.idx2token.get(sequence[k], '') for k in range(i, j))
                 smiles += atom_token
@@ -2912,5 +2914,832 @@ def train(
     if world_size > 1:
         dist.barrier()
     
+    cleanup_ddp()
+    return []
+
+
+# ======================== REINFORCE Tanimoto Loss ========================
+
+def compute_reinforce_tanimoto_loss(
+    model: MolScribeModel,
+    img_features: torch.Tensor,
+    gt_smiles_list: List[str],
+    vocab: MolScannerVocab,
+    device: torch.device,
+    max_len: int = 150,
+    baseline: float = 0.0,
+    temperature: float = 1.0,
+    n_samples: int = 1,
+) -> Tuple[torch.Tensor, Dict]:
+    """REINFORCE-based Tanimoto similarity loss for MolScribe.
+
+    Treats the autoregressive decoder as a stochastic policy π_θ that
+    emits tokens.  The Tanimoto similarity between a sampled SMILES and
+    the ground truth becomes a reward signal R.
+
+    L_RL = −(R − baseline) · Σ_t log P(a_t | a_{1:t−1}, image; θ)
+
+    Memory-efficient implementation:
+      - Autoregressive sampling is done under ``torch.no_grad()`` (no graph
+        stored for the sequential decoding loop).
+      - After sampling, a SINGLE teacher-forced forward pass through the
+        decoder with the sampled sequence recomputes ``log P`` for all
+        timesteps in one call.  This produces a compact gradient graph
+        (one decoder call instead of T calls).
+
+    When ``n_samples > 1``, each image is decoded ``n_samples`` times and
+    the self-critical baseline (mean reward across samples) is used for
+    lower variance.
+
+    Args:
+        model: MolScribeModel (must NOT be DDP-wrapped — pass ``actual_model``).
+        img_features: [B, d_model, H, W] encoded image features.
+            These should be **detached** from the encoder graph to save memory;
+            gradients will still flow through the decoder.
+        gt_smiles_list: Ground truth SMILES, length B.
+        vocab: MolScannerVocab.
+        device: Compute device.
+        max_len: Max autoregressive decode length.
+        baseline: Constant baseline (overridden by self-critical when n_samples>1).
+        temperature: Softmax temperature for exploration.
+        n_samples: Number of samples per image for variance reduction.
+
+    Returns:
+        loss: Scalar tensor with gradient graph (through decoder params).
+        info: Dict with 'mean_reward', 'mean_log_prob', 'sampled_smiles', 'n_valid'.
+    """
+    B = img_features.size(0)
+    total_seqs = B * n_samples
+
+    # Replicate features and GT SMILES for multiple samples
+    if n_samples > 1:
+        img_features_expanded = img_features.repeat_interleave(n_samples, dim=0)
+        gt_expanded = [s for s in gt_smiles_list for _ in range(n_samples)]
+    else:
+        img_features_expanded = img_features
+        gt_expanded = gt_smiles_list
+
+    # ===== Phase 1: Sample sequences WITHOUT building the gradient graph =====
+    # This avoids O(T) decoder forward passes stored in memory.
+    sampled_seqs_list: List[List[int]] = []
+    with torch.no_grad():
+        seqs = torch.full((total_seqs, 1), vocab.sos_idx, dtype=torch.long, device=device)
+        finished = torch.zeros(total_seqs, dtype=torch.bool, device=device)
+
+        for _step in range(max_len):
+            if finished.all():
+                break
+
+            _hidden, logits = model.sequence_decoder(img_features_expanded, seqs)
+            next_logits = logits[:, -1, :]
+
+            for b in range(total_seqs):
+                if not finished[b]:
+                    next_logits[b] = model._apply_constraints(
+                        next_logits[b], seqs[b, -1].item()
+                    )
+
+            scaled_logits = next_logits / temperature
+            probs = F.softmax(scaled_logits, dim=-1)
+            sampled_tokens = torch.multinomial(probs, 1).squeeze(-1)
+
+            sampled_tokens = torch.where(
+                finished,
+                torch.full_like(sampled_tokens, vocab.pad_idx),
+                sampled_tokens,
+            )
+            finished = finished | (sampled_tokens == vocab.eos_idx)
+            seqs = torch.cat([seqs, sampled_tokens.unsqueeze(1)], dim=1)
+
+        # Convert to list-of-lists, trim to EOS
+        for b in range(total_seqs):
+            seq = seqs[b].tolist()
+            if vocab.eos_idx in seq:
+                seq = seq[:seq.index(vocab.eos_idx) + 1]
+            sampled_seqs_list.append(seq)
+
+    # ===== Phase 2: Compute Tanimoto rewards (CPU, non-differentiable) =====
+    rewards = torch.zeros(total_seqs, device=device)
+    sampled_smiles = []
+    n_valid = 0
+
+    for b in range(total_seqs):
+        result = vocab.sequence_to_smiles(sampled_seqs_list[b])
+        pred_smiles = result.get('smiles', '')
+        sampled_smiles.append(pred_smiles)
+        tanimoto = compute_tanimoto_similarity(pred_smiles, gt_expanded[b])
+        rewards[b] = tanimoto
+        if tanimoto > 0:
+            n_valid += 1
+
+    # ===== Phase 3: One teacher-forced forward pass to get log P(sampled) =====
+    # Pad sampled sequences to the same length
+    max_seq_len = max(len(s) for s in sampled_seqs_list)
+    padded_seqs = torch.full((total_seqs, max_seq_len), vocab.pad_idx,
+                             dtype=torch.long, device=device)
+    seq_lengths = torch.zeros(total_seqs, dtype=torch.long, device=device)
+    for b, seq in enumerate(sampled_seqs_list):
+        padded_seqs[b, :len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
+        seq_lengths[b] = len(seq)
+
+    # Teacher-forced forward: input = seq[:-1], target = seq[1:]
+    tf_input = padded_seqs[:, :-1]
+    tf_target = padded_seqs[:, 1:]
+    T_out = tf_target.size(1)
+
+    # This single forward pass IS differentiable w.r.t. decoder parameters
+    _hidden, tf_logits = model.sequence_decoder(img_features_expanded, tf_input)
+    # tf_logits: [total_seqs, T_out, vocab_size]
+
+    # Compute per-token log P
+    log_probs = F.log_softmax(tf_logits / temperature, dim=-1)  # [total_seqs, T_out, V]
+    # Gather log P of the actually-sampled tokens
+    token_log_probs = log_probs.gather(2, tf_target.unsqueeze(-1)).squeeze(-1)  # [total_seqs, T_out]
+
+    # Mask out padding positions
+    pad_mask = (tf_target != vocab.pad_idx).float()  # [total_seqs, T_out]
+    log_probs_sum = (token_log_probs * pad_mask).sum(dim=1)  # [total_seqs]
+
+    # ===== Phase 4: REINFORCE loss =====
+    if n_samples > 1:
+        rewards_reshaped = rewards.view(B, n_samples)
+        sc_baseline = rewards_reshaped.mean(dim=1, keepdim=True)
+        advantages = (rewards_reshaped - sc_baseline).view(-1).detach()
+    else:
+        advantages = (rewards - baseline).detach()
+
+    reinforce_loss = -(advantages * log_probs_sum).mean()
+
+    info = {
+        'mean_reward': rewards.mean().item(),
+        'mean_log_prob': log_probs_sum.mean().item(),
+        'sampled_smiles': sampled_smiles[:B],
+        'n_valid': n_valid,
+    }
+
+    return reinforce_loss, info
+
+
+# ======================== RL Finetuning Training Loop ========================
+
+def train_rl_finetune(
+    # data
+    smiles_list: List[str],
+    smiles_num: int,
+    # training
+    save_path: str,
+    pretrained_path: str,
+    num_epochs: int = 10,
+    batch_size: int = 32,
+    encoder_lr: float = 1e-5,
+    decoder_lr: float = 1e-5,
+    weight_decay: float = 1e-6,
+    warmup_ratio: float = 0.02,
+    seed: int = 2026,
+    early_stopping_patience: int = 10,
+    # Validation
+    benchmark_dir: str = '',
+    benchmark_csv_path: str = '',
+    val_max_samples: Optional[int] = None,
+    # Molecule
+    max_atoms: int = 100,
+    mol_augment: bool = True,
+    # Vision encoder
+    image_size: Tuple[int, int] = (384, 384),
+    n_bins: int = 64,
+    backbone: str = 'swin_b',
+    # decoder
+    d_model: int = 256,
+    nhead: int = 8,
+    num_decoder_layers: int = 6,
+    dim_feedforward: int = 1024,
+    dropout: float = 0.1,
+    # ===== Loss weights =====
+    token_loss_weight: float = 1.0,
+    bond_loss_weight: float = 1.0,
+    # ===== RL hyperparameters =====
+    alpha_rl_max: float = 0.5,
+    alpha_rl_warmup_epochs: int = 3,
+    rl_every_n_steps: int = 5,
+    rl_max_len: int = 500,
+    rl_temperature: float = 0.8,
+    rl_n_samples: int = 1,
+    rl_subsample: int = 16,
+    # ===== optimization =====
+    num_workers: int = 4,
+    use_amp: bool = True,
+    use_gradient_checkpointing: bool = False,
+    force_cpu: bool = False,
+    # ===== resume =====
+    resume_from: Optional[str] = None,
+) -> List[float]:
+    """RL finetuning loop: MLE + REINFORCE Tanimoto loss with DDP support.
+
+    Loads a pretrained MolScribe model and finetunes it with a combined loss:
+
+        L_total = w_t·L_token + w_b·L_bond + α(t) · L_REINFORCE
+
+    where α(t) is linearly annealed from 0 → alpha_rl_max over
+    alpha_rl_warmup_epochs, then held constant.
+
+    The REINFORCE loss uses Tanimoto similarity as the reward signal.
+    To manage the cost of autoregressive sampling, RL loss is computed
+    only every ``rl_every_n_steps`` MLE steps.
+
+    Launch with:
+        torchrun --nproc_per_node=<N_GPUS> train_rl_finetune.py
+
+    Args:
+        pretrained_path: Path to .pth file with pretrained model weights.
+        alpha_rl_max: Maximum RL loss weight after warmup.
+        alpha_rl_warmup_epochs: Epochs over which to linearly anneal α.
+        rl_every_n_steps: Compute RL loss every N training steps.
+        rl_max_len: Max sequence length for RL autoregressive sampling.
+        rl_temperature: Sampling temperature for RL exploration.
+        rl_n_samples: Number of samples per image in REINFORCE (>1 enables self-critical).
+        (other args same as train())
+    """
+    # ===== DDP setup =====
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    world_size = int(os.environ.get('WORLD_SIZE', 1))
+
+    if force_cpu or not torch.cuda.is_available():
+        device = torch.device('cpu')
+        use_amp = False
+        if is_main_process():
+            print('Forcing CPU mode')
+    else:
+        if world_size > 1:
+            setup_ddp(local_rank, world_size)
+        device = torch.device(f'cuda:{local_rank}')
+        torch.cuda.set_device(device)
+
+    if is_main_process():
+        if world_size > 1:
+            print(f'DDP RL Finetuning: {world_size} GPUs')
+            for i in range(world_size):
+                print(f'  GPU {i}: {torch.cuda.get_device_name(i)}')
+        else:
+            print(f'Single GPU RL finetuning on: {device}')
+        effective_batch = batch_size * world_size
+        print(f'Per-GPU batch size: {batch_size}, Effective batch size: {effective_batch}')
+        print(f'RL config: alpha_rl_max={alpha_rl_max}, warmup={alpha_rl_warmup_epochs}ep, '
+              f'every_n={rl_every_n_steps}, temp={rl_temperature}, n_samples={rl_n_samples}, '
+              f'subsample={rl_subsample}, max_len={rl_max_len}')
+        print(f'Loss weights: token={token_loss_weight}, bond={bond_loss_weight}')
+        print(f'Pretrained model: {pretrained_path}')
+
+    # Seed
+    torch.manual_seed(seed)
+    np.random.seed(seed + local_rank)
+    random.seed(seed + local_rank)
+
+    # Vocab
+    vocab = MolScannerVocab(n_bins=n_bins)
+    if is_main_process():
+        print(f'Vocab size: {len(vocab)}')
+
+    # Prepare training data
+    n = len(smiles_list)
+    rng = np.random.default_rng(seed)
+    indices = np.arange(n)
+    rng.shuffle(indices)
+    indices = indices[:smiles_num]
+    train_smiles = [smiles_list[i] for i in indices]
+
+    if is_main_process():
+        print(f'Train size: {len(train_smiles)}')
+
+    # Dataset
+    train_dataset = MoleculeDataset(
+        smiles_list=train_smiles,
+        shuffle_smiles=True,
+        vocab=vocab,
+        image_size=image_size,
+        mol_augment=mol_augment,
+        geo_augment=True,
+        img_augment=True,
+    )
+
+    bond_class_weights = get_bond_class_weights()
+
+    # Sampler
+    train_sampler = DistributedSampler(
+        train_dataset, num_replicas=world_size, rank=local_rank,
+        shuffle=True, seed=seed,
+    ) if world_size > 1 else None
+
+    dl_common = {
+        'batch_size': batch_size,
+        'num_workers': num_workers,
+        'pin_memory': device.type == 'cuda',
+        'collate_fn': partial(collate_fn, vocab=vocab, max_atoms_limit=max_atoms),
+        'shuffle': (train_sampler is None),
+        'sampler': train_sampler,
+        'drop_last': True,
+    }
+    if num_workers > 0:
+        dl_common.update({
+            'prefetch_factor': 4,
+            'persistent_workers': False,
+            'multiprocessing_context': 'forkserver',
+            'timeout': 60,
+        })
+
+    def _make_loader():
+        return DataLoader(train_dataset, **dl_common)
+
+    train_loader = _make_loader()
+
+    # ===== Model (load pretrained) =====
+    model = MolScribeModel(
+        vocab=vocab,
+        backbone=backbone,
+        pretrained=False,  # will load weights from checkpoint
+        d_model=d_model,
+        nhead=nhead,
+        num_decoder_layers=num_decoder_layers,
+        dim_feedforward=dim_feedforward,
+        dropout=dropout,
+        use_gradient_checkpointing=use_gradient_checkpointing,
+    ).to(device)
+
+    # Load pretrained weights
+    if is_main_process():
+        print(f'Loading pretrained weights from {pretrained_path} ...')
+    model.load_model(pretrained_path, device=device)
+
+    # Wrap with DDP — find_unused_parameters=False is safe because the DDP
+    # forward call is only used for MLE (encoder + decoder + bond_predictor,
+    # all parameters exercised). The RL path bypasses DDP via actual_model.
+    if world_size > 1:
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False,
+                    gradient_as_bucket_view=True)
+
+    actual_model = model.module if hasattr(model, 'module') else model
+
+    # ===== Optimizer (smaller LR for finetuning) =====
+    encoder_param_ids = {id(p) for p in actual_model.image_encoder.parameters()}
+    encoder_params = [p for p in actual_model.parameters() if id(p) in encoder_param_ids]
+    decoder_params = [p for p in actual_model.parameters() if id(p) not in encoder_param_ids]
+
+    optimizer = torch.optim.AdamW([
+        {'params': encoder_params, 'lr': encoder_lr, 'weight_decay': weight_decay},
+        {'params': decoder_params, 'lr': decoder_lr, 'weight_decay': weight_decay},
+    ])
+
+    # Scheduler (cosine with warmup)
+    steps_per_epoch = len(train_loader)
+    total_steps = steps_per_epoch * num_epochs
+    warmup_steps = int(total_steps * warmup_ratio)
+
+    if is_main_process():
+        print(f'Steps/epoch: {steps_per_epoch}, Total steps: {total_steps}, '
+              f'Warmup steps: {warmup_steps}')
+
+    def lr_lambda(current_step: int) -> float:
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return max(0.0, 0.5 * (1.0 + np.cos(np.pi * progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scaler = torch.amp.GradScaler('cuda') if (use_amp and device.type == 'cuda') else None
+
+    # ===== Resume from RL finetuning checkpoint =====
+    start_epoch = 1
+    best_val_acc = 0.0
+    epochs_no_improve = 0
+    global_step = 0
+    rl_baseline_ema = 0.0  # exponential moving average of rewards
+    resume_log_dir = None
+
+    if resume_from is not None and os.path.isfile(resume_from):
+        if is_main_process():
+            print(f'Resuming RL finetuning from {resume_from}')
+        ckpt = torch.load(resume_from, map_location=device, weights_only=False)
+        actual_model.load_state_dict(ckpt['model_state_dict'])
+        if ckpt.get('optimizer_state_dict') is not None:
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        if ckpt.get('scheduler_state_dict') is not None:
+            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        if scaler is not None and ckpt.get('scaler_state_dict') is not None:
+            scaler.load_state_dict(ckpt['scaler_state_dict'])
+        saved_epoch = ckpt.get('epoch', 0)
+        epoch_completed = ckpt.get('epoch_completed', False)
+        start_epoch = saved_epoch + 1 if epoch_completed else saved_epoch
+        global_step = ckpt.get('global_step', 0)
+        best_val_acc = ckpt.get('best_val_acc', 0.0)
+        epochs_no_improve = ckpt.get('epochs_no_improve', 0)
+        rl_baseline_ema = ckpt.get('rl_baseline_ema', 0.0)
+        resume_log_dir = ckpt.get('log_dir', None)
+        if is_main_process():
+            status = 'completed' if epoch_completed else 'interrupted'
+            print(f'  Epoch {saved_epoch} ({status}), resuming from epoch {start_epoch}')
+            print(f'  global_step={global_step}, best_val_acc={best_val_acc:.4f}, '
+                  f'rl_baseline_ema={rl_baseline_ema:.4f}')
+        del ckpt
+        torch.cuda.empty_cache()
+
+    # TensorBoard
+    writer = None
+    if is_main_process():
+        os.makedirs(save_path, exist_ok=True)
+        if resume_log_dir and os.path.isdir(resume_log_dir):
+            log_dir = resume_log_dir
+            print(f'TensorBoard logs (resumed): {log_dir}')
+        else:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            log_dir = os.path.join(save_path, 'logs', f'rl_{timestamp}')
+            print(f'TensorBoard logs: {log_dir}')
+        writer = SummaryWriter(log_dir=log_dir)
+    else:
+        log_dir = None
+
+    # Broadcast log_dir to all ranks
+    if world_size > 1:
+        if is_main_process():
+            log_dir_bytes = log_dir.encode('utf-8')
+            log_dir_len = torch.tensor([len(log_dir_bytes)], dtype=torch.long, device=device)
+        else:
+            log_dir_len = torch.tensor([0], dtype=torch.long, device=device)
+        dist.broadcast(log_dir_len, src=0)
+        if is_main_process():
+            log_dir_tensor = torch.tensor(list(log_dir_bytes), dtype=torch.uint8, device=device)
+        else:
+            log_dir_tensor = torch.zeros(int(log_dir_len.item()), dtype=torch.uint8, device=device)
+        dist.broadcast(log_dir_tensor, src=0)
+        if not is_main_process():
+            log_dir = bytes(log_dir_tensor.cpu().tolist()).decode('utf-8')
+
+    # Helper: compute alpha_rl at a given epoch
+    def _get_alpha_rl(epoch: int) -> float:
+        if alpha_rl_warmup_epochs <= 0:
+            return alpha_rl_max
+        progress = min(1.0, (epoch - 1) / alpha_rl_warmup_epochs)
+        return alpha_rl_max * progress
+
+    # ===== Training Loop =====
+    for epoch in range(start_epoch, num_epochs + 1):
+        model.train()
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
+        current_alpha = _get_alpha_rl(epoch)
+        if is_main_process():
+            print(f'\nEpoch {epoch}/{num_epochs}  alpha_rl={current_alpha:.4f}  '
+                  f'rl_baseline_ema={rl_baseline_ema:.4f}')
+
+        running_loss = 0.0
+        running_rl_loss = 0.0
+        running_reward = 0.0
+        num_batches = 0
+        num_rl_steps = 0
+
+        steps_in_epoch = len(train_loader)
+        train_bar = tqdm(total=steps_in_epoch, desc=f'Epoch {epoch} [RL-FT]',
+                         disable=not is_main_process())
+        train_iter = iter(train_loader)
+
+        for _step in range(steps_in_epoch):
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                break
+            except RuntimeError as e:
+                if is_main_process():
+                    warnings.warn(f"DataLoader error at epoch {epoch} step {_step}: {e}")
+                batch = None
+                del train_iter
+                train_loader = _make_loader()
+                train_iter = iter(train_loader)
+
+            # DDP-safe batch validity
+            batch_valid = batch is not None
+            if world_size > 1:
+                valid_tensor = torch.tensor([1 if batch_valid else 0],
+                                           dtype=torch.int32, device=device)
+                dist.all_reduce(valid_tensor, op=dist.ReduceOp.MIN)
+                batch_valid = valid_tensor.item() == 1
+            if not batch_valid:
+                train_bar.update(1)
+                continue
+
+            images = batch['images'].to(device, non_blocking=True).contiguous()
+            tgt_tokens = batch['tgt_tokens'].to(device, non_blocking=True).contiguous()
+            tgt_padding_mask = batch['tgt_padding_mask'].to(device, non_blocking=True).contiguous()
+            atom_indices = batch['atom_indices'].to(device, non_blocking=True).contiguous()
+            atom_mask = batch['atom_mask'].to(device, non_blocking=True).contiguous()
+            max_atoms_val = batch['max_atoms']
+            bond_matrices_list = batch['bond_matrices_list']
+
+            tgt_tokens, tgt_padding_mask, atom_indices, atom_mask = truncate_sequences(
+                tgt_tokens, tgt_padding_mask, atom_indices, atom_mask, max_seq_len=1000
+            )
+
+            tgt_input = tgt_tokens[:, :-1].contiguous()
+            tgt_target = tgt_tokens[:, 1:].contiguous()
+            tgt_input_mask = tgt_padding_mask[:, :-1].contiguous()
+
+            optimizer.zero_grad(set_to_none=True)
+
+            # Determine whether this step includes RL loss
+            do_rl = (current_alpha > 0) and (_step % rl_every_n_steps == 0)
+
+            # Max images used for RL sampling (caps memory)
+            rl_subsample_actual = min(rl_subsample, images.size(0))
+
+            # ---------- Phase 1: MLE forward + backward (separate from RL) ----------
+            if scaler is not None:
+                with torch.amp.autocast('cuda'):
+                    token_logits, edge_logits, _hidden = model(
+                        images=images,
+                        tgt_tokens=tgt_input,
+                        tgt_key_padding_mask=tgt_input_mask,
+                        atom_indices=atom_indices,
+                        atom_mask=atom_mask,
+                        max_atoms=max_atoms_val,
+                    )
+                    del _hidden
+
+                    mle_losses = compute_losses(
+                        token_logits=token_logits,
+                        edge_logits=edge_logits,
+                        tgt_tokens=tgt_target,
+                        bond_matrices_list=bond_matrices_list,
+                        vocab=vocab,
+                        bond_class_weights=bond_class_weights,
+                    )
+                    mle_loss = (token_loss_weight * mle_losses['token_loss']
+                                + bond_loss_weight * mle_losses['bond_loss'])
+
+                # MLE backward — free the MLE graph before RL
+                scaler.scale(mle_loss).backward()
+                del token_logits, edge_logits, mle_loss
+                torch.cuda.empty_cache()
+
+                # ---------- Phase 2: RL forward + backward (every N steps) ----------
+                rl_loss_val = torch.tensor(0.0, device=device)
+                rl_reward = 0.0
+                if do_rl:
+                    # Encode a SUBSAMPLE of images for RL (no autocast — fp32 for stability)
+                    rl_images = images[:rl_subsample_actual]
+                    with torch.no_grad():
+                        img_features = actual_model.image_encoder(rl_images)
+                        img_features = actual_model.pos_enc_2d(img_features)
+                    # Detach: gradients flow through decoder only (REINFORCE)
+                    img_features = img_features.detach().float()
+
+                    # Reconstruct GT SMILES for the subsampled images
+                    gt_smiles_batch = []
+                    for b in range(rl_subsample_actual):
+                        seq_b = tgt_tokens[b].tolist()
+                        res = vocab.sequence_to_smiles(seq_b)
+                        gt_smiles_batch.append(res.get('smiles', ''))
+
+                    rl_loss, rl_info = compute_reinforce_tanimoto_loss(
+                        model=actual_model,
+                        img_features=img_features,
+                        gt_smiles_list=gt_smiles_batch,
+                        vocab=vocab,
+                        device=device,
+                        max_len=rl_max_len,
+                        baseline=rl_baseline_ema,
+                        temperature=rl_temperature,
+                        n_samples=rl_n_samples,
+                    )
+                    rl_loss_val = rl_loss
+                    rl_reward = rl_info['mean_reward']
+
+                    # RL backward — gradients accumulate with MLE grads
+                    scaled_rl = current_alpha * rl_loss_val
+                    scaler.scale(scaled_rl).backward()
+                    del img_features, rl_loss, scaled_rl
+
+                    # Update EMA baseline
+                    rl_baseline_ema = 0.9 * rl_baseline_ema + 0.1 * rl_reward
+
+                # Clip & step (accumulated MLE + RL gradients)
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+
+                mle_loss_val = (token_loss_weight * mle_losses['token_loss'].item()
+                                + bond_loss_weight * mle_losses['bond_loss'].item())
+                total_loss_val = mle_loss_val + current_alpha * rl_loss_val.item()
+            else:
+                token_logits, edge_logits, _hidden = model(
+                    images=images,
+                    tgt_tokens=tgt_input,
+                    tgt_key_padding_mask=tgt_input_mask,
+                    atom_indices=atom_indices,
+                    atom_mask=atom_mask,
+                    max_atoms=max_atoms_val,
+                )
+                del _hidden
+
+                mle_losses = compute_losses(
+                    token_logits=token_logits,
+                    edge_logits=edge_logits,
+                    tgt_tokens=tgt_target,
+                    bond_matrices_list=bond_matrices_list,
+                    vocab=vocab,
+                    bond_class_weights=bond_class_weights,
+                )
+                mle_loss = (token_loss_weight * mle_losses['token_loss']
+                            + bond_loss_weight * mle_losses['bond_loss'])
+
+                # MLE backward first — free graph before RL
+                mle_loss.backward()
+                del token_logits, edge_logits, mle_loss
+                torch.cuda.empty_cache()
+
+                rl_loss_val = torch.tensor(0.0, device=device)
+                rl_reward = 0.0
+                if do_rl:
+                    rl_images = images[:rl_subsample_actual]
+                    with torch.no_grad():
+                        img_features = actual_model.image_encoder(rl_images)
+                        img_features = actual_model.pos_enc_2d(img_features)
+                    img_features = img_features.detach()
+
+                    gt_smiles_batch = []
+                    for b in range(rl_subsample_actual):
+                        seq_b = tgt_tokens[b].tolist()
+                        res = vocab.sequence_to_smiles(seq_b)
+                        gt_smiles_batch.append(res.get('smiles', ''))
+
+                    rl_loss, rl_info = compute_reinforce_tanimoto_loss(
+                        model=actual_model,
+                        img_features=img_features,
+                        gt_smiles_list=gt_smiles_batch,
+                        vocab=vocab,
+                        device=device,
+                        max_len=rl_max_len,
+                        baseline=rl_baseline_ema,
+                        temperature=rl_temperature,
+                        n_samples=rl_n_samples,
+                    )
+                    rl_loss_val = rl_loss
+                    rl_reward = rl_info['mean_reward']
+                    (current_alpha * rl_loss_val).backward()
+                    del img_features, rl_loss
+                    rl_baseline_ema = 0.9 * rl_baseline_ema + 0.1 * rl_reward
+
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+
+                mle_loss_val = (token_loss_weight * mle_losses['token_loss'].item()
+                                + bond_loss_weight * mle_losses['bond_loss'].item())
+                total_loss_val = mle_loss_val + current_alpha * rl_loss_val.item()
+
+            scheduler.step()
+
+            running_loss += total_loss_val
+            num_batches += 1
+            global_step += 1
+
+            if do_rl:
+                running_rl_loss += rl_loss_val.item()
+                running_reward += rl_reward
+                num_rl_steps += 1
+
+            # Logging
+            if is_main_process():
+                postfix = {
+                    'loss': f"{total_loss_val:.2f}",
+                    't': f"{mle_losses['token_loss'].item():.2f}",
+                    'b': f"{mle_losses['bond_loss'].item():.2f}",
+                }
+                if do_rl:
+                    postfix['rl'] = f"{rl_loss_val.item():.2f}"
+                    postfix['R'] = f"{rl_reward:.3f}"
+                train_bar.set_postfix(postfix)
+
+                writer.add_scalar('Loss/train_total', total_loss_val, global_step)
+                writer.add_scalar('Loss/train_token', mle_losses['token_loss'].item(), global_step)
+                writer.add_scalar('Loss/train_bond', mle_losses['bond_loss'].item(), global_step)
+                if do_rl:
+                    writer.add_scalar('Loss/rl_reinforce', rl_loss_val.item(), global_step)
+                    writer.add_scalar('RL/reward_tanimoto', rl_reward, global_step)
+                    writer.add_scalar('RL/baseline_ema', rl_baseline_ema, global_step)
+                    writer.add_scalar('RL/alpha', current_alpha, global_step)
+                current_lrs = scheduler.get_last_lr()
+                writer.add_scalar('LR/encoder', current_lrs[0], global_step)
+                writer.add_scalar('LR/decoder', current_lrs[1], global_step)
+
+            train_bar.update(1)
+
+            # Periodic checkpoint
+            if is_main_process() and global_step % 500 == 0:
+                model_to_save = model.module if hasattr(model, 'module') else model
+                ckpt_state = {
+                    'model_state_dict': model_to_save.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
+                    'epoch': epoch,
+                    'epoch_completed': False,
+                    'global_step': global_step,
+                    'best_val_acc': best_val_acc,
+                    'epochs_no_improve': epochs_no_improve,
+                    'rl_baseline_ema': rl_baseline_ema,
+                    'log_dir': log_dir,
+                }
+                torch.save(ckpt_state, os.path.join(save_path, 'checkpoint_resume.pth'))
+
+        train_bar.close()
+
+        # End-of-epoch summary
+        avg_loss = running_loss / max(num_batches, 1)
+        avg_rl = running_rl_loss / max(num_rl_steps, 1)
+        avg_reward = running_reward / max(num_rl_steps, 1)
+        if is_main_process():
+            print(f'Epoch {epoch}: avg_loss={avg_loss:.4f}, avg_rl_loss={avg_rl:.4f}, '
+                  f'avg_reward={avg_reward:.4f}, rl_steps={num_rl_steps}')
+
+        # ===== Validation =====
+        val_metrics = validate(
+            model=model,
+            benchmark_dir=benchmark_dir,
+            benchmark_csv_path=benchmark_csv_path,
+            device=device,
+            epoch=epoch,
+            writer=writer,
+            global_step=global_step,
+            beam_size=1,
+            max_samples=val_max_samples,
+        )
+
+        if is_main_process():
+            val_acc = val_metrics['exact_match_acc']
+            model_to_save = model.module if hasattr(model, 'module') else model
+
+            if val_acc > best_val_acc:
+                epochs_no_improve = 0
+                best_val_acc = val_acc
+                torch.save(model_to_save.state_dict(), os.path.join(save_path, 'best.pth'))
+                print(f'New best model (exact_match_acc={best_val_acc:.4f})')
+            else:
+                epochs_no_improve += 1
+                print(f'No improvement for {epochs_no_improve} epoch(s).')
+
+            torch.save(model_to_save.state_dict(), os.path.join(save_path, f'epoch_{epoch}.pth'))
+
+            ckpt_state = {
+                'model_state_dict': model_to_save.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
+                'epoch': epoch,
+                'epoch_completed': True,
+                'global_step': global_step,
+                'best_val_acc': best_val_acc,
+                'epochs_no_improve': epochs_no_improve,
+                'rl_baseline_ema': rl_baseline_ema,
+                'log_dir': log_dir,
+            }
+            torch.save(ckpt_state, os.path.join(save_path, 'checkpoint_resume.pth'))
+
+            should_stop = epochs_no_improve >= early_stopping_patience
+        else:
+            should_stop = False
+
+        if world_size > 1:
+            stop_tensor = torch.tensor([1 if should_stop else 0], device=device)
+            dist.broadcast(stop_tensor, src=0)
+            should_stop = stop_tensor.item() == 1
+
+        if should_stop:
+            if is_main_process():
+                print(f'Early stopping at epoch {epoch}.')
+                model_to_save = model.module if hasattr(model, 'module') else model
+                torch.save(model_to_save.state_dict(), os.path.join(save_path, 'final.pth'))
+                writer.close()
+            if world_size > 1:
+                dist.barrier()
+            del model, optimizer, scaler
+            torch.cuda.empty_cache()
+            cleanup_ddp()
+            return []
+
+        if world_size > 1:
+            dist.barrier()
+        model.train()
+
+    # Final save
+    if is_main_process():
+        model_to_save = model.module if hasattr(model, 'module') else model
+        torch.save(model_to_save.state_dict(), os.path.join(save_path, 'final.pth'))
+        writer.close()
+        print('RL finetuning complete!')
+
+    del model, optimizer, scaler
+    torch.cuda.empty_cache()
+
+    if world_size > 1:
+        dist.barrier()
+
     cleanup_ddp()
     return []

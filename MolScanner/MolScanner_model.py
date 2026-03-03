@@ -318,14 +318,16 @@ class MolScannerVocab:
                 else:
                     i = j
 
-            # --- Regular atom (uppercase letter, possibly followed by lowercase for Cl/Br) ---
-            elif token_str.isalpha() and token_str.isupper():
+            # --- Regular atom (uppercase letter, or lowercase aromatic atom) ---
+            elif token_str.isalpha():
                 j = i + 1
-                # Check for two-letter atoms: Cl, Br
+                # Check for two-letter atoms: Cl, Br (uppercase), se, te (aromatic)
                 if (j < len(sequence) and self.is_symbol(sequence[j])):
                     next_ch = self.idx2token.get(sequence[j], '')
                     if ((token_str == 'C' and next_ch == 'l')
-                            or (token_str == 'B' and next_ch == 'r')):
+                            or (token_str == 'B' and next_ch == 'r')
+                            or (token_str == 's' and next_ch == 'e')
+                            or (token_str == 't' and next_ch == 'e')):
                         j = i + 2
                 atom_token = ''.join(self.idx2token.get(sequence[k], '') for k in range(i, j))
                 smiles += atom_token
