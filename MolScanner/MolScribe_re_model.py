@@ -564,7 +564,7 @@ class MoleculeDataset(Dataset):
         self.img_transforms_list = []
         if self.img_augment:
             self.img_transforms_list += [
-                A.Downscale(scale_range=(0.2, 0.5), interpolation_pair={'upscale': 3, 'downscale': 3}),
+                A.Downscale(scale_range=(0.5, 0.8), interpolation_pair={'upscale': 3, 'downscale': 3}),
                 A.Blur(),
                 A.GaussNoise(),
                 A.SaltAndPepper()
