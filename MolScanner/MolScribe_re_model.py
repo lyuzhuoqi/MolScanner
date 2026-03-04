@@ -870,6 +870,69 @@ class PositionalEncoding2D(nn.Module):
         pe = pe_tensor[:H, :W, :].permute(2, 0, 1).unsqueeze(0)  # [1, d_model, H, W]
         return x + pe
 
+
+# ======================== KV-Cache Helpers ========================
+
+def _mha_with_kv_cache(
+    mha: nn.MultiheadAttention,
+    q_input: torch.Tensor,
+    kv_new_input: Optional[torch.Tensor],
+    cached_k: Optional[torch.Tensor],
+    cached_v: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Multi-head attention with KV-cache for incremental decoding.
+
+    Projects only the *new* tokens for K/V, concatenates with cached K/V from
+    previous steps, and computes attention for the query input.
+
+    Args:
+        mha: ``nn.MultiheadAttention`` module (must use packed ``in_proj_weight``).
+        q_input:  ``[B, Lq, d_model]`` query input.
+        kv_new_input: ``[B, Lnew, d_model]`` new key/value input to project and
+                      append to cache, **or** ``None`` to reuse the cache as-is
+                      (useful for cross-attention after the first step).
+        cached_k: ``[B, n_heads, Lprev, d_head]`` or ``None``.
+        cached_v: ``[B, n_heads, Lprev, d_head]`` or ``None``.
+
+    Returns:
+        output:  ``[B, Lq, d_model]`` attention output.
+        new_k:   ``[B, n_heads, Lprev+Lnew, d_head]`` updated key cache.
+        new_v:   ``[B, n_heads, Lprev+Lnew, d_head]`` updated value cache.
+    """
+    B = q_input.size(0)
+    d = mha.embed_dim
+    n_heads = mha.num_heads
+    d_head = d // n_heads
+
+    W = mha.in_proj_weight  # [3d, d]
+    b = mha.in_proj_bias    # [3d] or None
+
+    # --- Q projection (always from q_input) ---
+    q = F.linear(q_input, W[:d], b[:d] if b is not None else None)
+    q = q.view(B, -1, n_heads, d_head).transpose(1, 2)  # [B, heads, Lq, d_head]
+
+    # --- K / V projection + cache concatenation ---
+    if kv_new_input is not None:
+        k_new = F.linear(kv_new_input, W[d:2*d], b[d:2*d] if b is not None else None)
+        v_new = F.linear(kv_new_input, W[2*d:],  b[2*d:]  if b is not None else None)
+        k_new = k_new.view(B, -1, n_heads, d_head).transpose(1, 2)
+        v_new = v_new.view(B, -1, n_heads, d_head).transpose(1, 2)
+        k = torch.cat([cached_k, k_new], dim=2) if cached_k is not None else k_new
+        v = torch.cat([cached_v, v_new], dim=2) if cached_v is not None else v_new
+    else:
+        assert cached_k is not None, "Must provide kv_new_input or cached_k/v"
+        k, v = cached_k, cached_v
+
+    # --- Scaled dot-product attention ---
+    attn = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_head)
+    attn = F.softmax(attn, dim=-1)
+    out = torch.matmul(attn, v)                              # [B, heads, Lq, d_head]
+    out = out.transpose(1, 2).contiguous().view(B, -1, d)    # [B, Lq, d]
+    out = F.linear(out, mha.out_proj.weight, mha.out_proj.bias)
+
+    return out, k, v
+
+
 # ======================== Sequence Decoder (Transformer) ========================
 
 class SequenceDecoder(nn.Module):
@@ -992,6 +1055,78 @@ class SequenceDecoder(nn.Module):
         logits = self.output_head(output)  # [B, T, vocab_size]
         
         return output, logits
+
+    def forward_step_cached(
+        self,
+        memory: torch.Tensor,
+        new_token_ids: torch.Tensor,
+        step_idx: int,
+        cache: Optional[List[Dict[str, Optional[torch.Tensor]]]],
+    ) -> Tuple[torch.Tensor, List[Dict[str, Optional[torch.Tensor]]]]:
+        """One-step forward through the decoder with a KV-cache.
+
+        Instead of re-encoding the full growing sequence at every step
+        (*O(T²)* per step, *O(T³)* total), this method processes only the
+        **new token** and reuses projected K/V tensors from earlier steps
+        (*O(T)* per step, *O(T²)* total).
+
+        Args:
+            memory: ``[B, S, d_model]`` flattened encoder features (compute
+                    once via ``img_features.flatten(2).permute(0,2,1)``).
+            new_token_ids: ``[B]`` token indices for the current step.
+            step_idx: 0-based decoding step index.
+            cache: list of per-layer dicts with keys ``self_k``, ``self_v``,
+                   ``cross_k``, ``cross_v`` (each ``[B, heads, T, d_head]``
+                   or ``None``).  Pass ``None`` on the first call.
+
+        Returns:
+            logits: ``[B, vocab_size]`` next-token logits.
+            new_cache: updated cache (same structure, one dict per layer).
+        """
+        B = new_token_ids.size(0)
+        device = new_token_ids.device
+
+        # Embed the single new token  →  [B, 1, d_model]
+        pos = torch.full((B, 1), step_idx, dtype=torch.long, device=device)
+        h = self.token_embedding(new_token_ids.unsqueeze(1)) + self.pos_encoder(pos)
+
+        num_layers = len(self.transformer_decoder.layers)
+        if cache is None:
+            cache = [
+                {'self_k': None, 'self_v': None, 'cross_k': None, 'cross_v': None}
+                for _ in range(num_layers)
+            ]
+
+        new_cache: List[Dict[str, Optional[torch.Tensor]]] = []
+        for i, layer in enumerate(self.transformer_decoder.layers):
+            lc = cache[i]
+
+            # --- Self-attention (post-norm, Q=new token, K/V grows) ---
+            sa_out, sa_k, sa_v = _mha_with_kv_cache(
+                layer.self_attn, h, h, lc['self_k'], lc['self_v'])
+            h = layer.norm1(h + layer.dropout1(sa_out))
+
+            # --- Cross-attention (K/V=memory, projected once at step 0) ---
+            cross_new = memory if lc['cross_k'] is None else None
+            ca_out, ca_k, ca_v = _mha_with_kv_cache(
+                layer.multihead_attn, h, cross_new, lc['cross_k'], lc['cross_v'])
+            h = layer.norm2(h + layer.dropout2(ca_out))
+
+            # --- Feed-forward ---
+            ff = layer.linear2(layer.dropout(layer.activation(layer.linear1(h))))
+            h = layer.norm3(h + layer.dropout3(ff))
+
+            new_cache.append({
+                'self_k': sa_k, 'self_v': sa_v,
+                'cross_k': ca_k, 'cross_v': ca_v,
+            })
+
+        # Final norm (present only if TransformerDecoder was built with one)
+        if self.transformer_decoder.norm is not None:
+            h = self.transformer_decoder.norm(h)
+
+        logits = self.output_head(h.squeeze(1))  # [B, vocab_size]
+        return logits, new_cache
 
 
 # ======================== Bond Predictor ========================
@@ -1602,6 +1737,83 @@ class MolScribeModel(nn.Module):
                 seq.pop()
             result.append(seq)
         
+        return result
+
+    def _sample_decode_batch(
+        self,
+        feats: torch.Tensor,
+        max_len: int,
+        device: torch.device,
+        temperature: float = 1.0,
+    ) -> List[List[int]]:
+        """Batched multinomial sampling with KV-cached decoding.
+
+        Mirrors :meth:`_greedy_decode_batch` but uses temperature-scaled
+        multinomial sampling instead of argmax, and replaces the O(T²)-per-
+        step full-sequence forward with the O(T)-per-step KV-cached
+        :meth:`SequenceDecoder.forward_step_cached`.
+
+        Intended for the RL sampling phase (called under ``torch.no_grad()``).
+
+        Args:
+            feats: ``[B, d_model, H, W]`` encoded image features.
+            max_len: maximum decoding length.
+            device: compute device.
+            temperature: softmax temperature (>1 → more exploration).
+
+        Returns:
+            List of token-id lists (length B), each starting with SOS and
+            ending with EOS (or truncated at *max_len*).
+        """
+        B = feats.size(0)
+        vocab = self.vocab
+
+        # Pre-flatten encoder features → memory [B, S, d_model]
+        memory = feats.flatten(2).permute(0, 2, 1)
+
+        tokens = torch.full((B,), vocab.sos_idx, dtype=torch.long, device=device)
+        seqs = tokens.unsqueeze(1)                  # [B, 1] running record
+        finished = torch.zeros(B, dtype=torch.bool, device=device)
+        cache = None
+
+        for step in range(max_len):
+            if finished.all():
+                break
+
+            logits, cache = self.sequence_decoder.forward_step_cached(
+                memory, tokens, step, cache
+            )  # logits: [B, vocab_size]
+
+            # Per-sequence structural constraints (cheap CPU ops)
+            for b in range(B):
+                if not finished[b]:
+                    logits[b] = self._apply_constraints(
+                        logits[b], seqs[b, -1].item()
+                    )
+
+            # Temperature-scaled multinomial sampling
+            probs = F.softmax(logits / temperature, dim=-1)
+            tokens = torch.multinomial(probs, 1).squeeze(-1)   # [B]
+
+            tokens = torch.where(
+                finished,
+                torch.full_like(tokens, vocab.pad_idx),
+                tokens,
+            )
+            finished = finished | (tokens == vocab.eos_idx)
+            seqs = torch.cat([seqs, tokens.unsqueeze(1)], dim=1)
+
+        # Convert to list-of-lists, trim to EOS
+        result = []
+        pad, eos = vocab.pad_idx, vocab.eos_idx
+        for b in range(B):
+            seq = seqs[b].tolist()
+            if eos in seq:
+                seq = seq[:seq.index(eos) + 1]
+            while seq and seq[-1] == pad:
+                seq.pop()
+            result.append(seq)
+
         return result
 
     def _postprocess_sequences_batch(self, all_seqs: List[List[int]],
@@ -2958,8 +3170,9 @@ def compute_reinforce_tanimoto_loss(
     Args:
         model: MolScribeModel (must NOT be DDP-wrapped — pass ``actual_model``).
         img_features: [B, d_model, H, W] encoded image features.
-            These should be **detached** from the encoder graph to save memory;
-            gradients will still flow through the decoder.
+            When gradients through the encoder are desired, pass features
+            **with** the computation graph attached; the REINFORCE loss will
+            back-propagate through both decoder and encoder.
         gt_smiles_list: Ground truth SMILES, length B.
         vocab: MolScannerVocab.
         device: Compute device.
@@ -2983,55 +3196,41 @@ def compute_reinforce_tanimoto_loss(
         img_features_expanded = img_features
         gt_expanded = gt_smiles_list
 
-    # ===== Phase 1: Sample sequences WITHOUT building the gradient graph =====
-    # This avoids O(T) decoder forward passes stored in memory.
-    sampled_seqs_list: List[List[int]] = []
+    # ===== Phase 1: Sample sequences with KV-cached decoding (no grad) =====
+    # Uses _sample_decode_batch which is O(T) per step instead of O(T²).
     with torch.no_grad():
-        seqs = torch.full((total_seqs, 1), vocab.sos_idx, dtype=torch.long, device=device)
-        finished = torch.zeros(total_seqs, dtype=torch.bool, device=device)
-
-        for _step in range(max_len):
-            if finished.all():
-                break
-
-            _hidden, logits = model.sequence_decoder(img_features_expanded, seqs)
-            next_logits = logits[:, -1, :]
-
-            for b in range(total_seqs):
-                if not finished[b]:
-                    next_logits[b] = model._apply_constraints(
-                        next_logits[b], seqs[b, -1].item()
-                    )
-
-            scaled_logits = next_logits / temperature
-            probs = F.softmax(scaled_logits, dim=-1)
-            sampled_tokens = torch.multinomial(probs, 1).squeeze(-1)
-
-            sampled_tokens = torch.where(
-                finished,
-                torch.full_like(sampled_tokens, vocab.pad_idx),
-                sampled_tokens,
-            )
-            finished = finished | (sampled_tokens == vocab.eos_idx)
-            seqs = torch.cat([seqs, sampled_tokens.unsqueeze(1)], dim=1)
-
-        # Convert to list-of-lists, trim to EOS
-        for b in range(total_seqs):
-            seq = seqs[b].tolist()
-            if vocab.eos_idx in seq:
-                seq = seq[:seq.index(vocab.eos_idx) + 1]
-            sampled_seqs_list.append(seq)
+        sampled_seqs_list = model._sample_decode_batch(
+            img_features_expanded, max_len, device, temperature
+        )
 
     # ===== Phase 2: Compute Tanimoto rewards (CPU, non-differentiable) =====
+    # Canonicalize GT SMILES: remove atom mapping + functional group handling
+    gt_canonical = []
+    for s in gt_expanded:
+        try:
+            s_clean = remove_atom_mapping(s)
+            # Also apply functional group replacement + expansion for GT
+            s_clean, mappings = _replace_functional_group(s_clean)
+            mol_tmp = Chem.MolFromSmiles(s_clean, sanitize=False)
+            if mol_tmp is not None:
+                s_clean, mol_tmp = _expand_functional_group(mol_tmp, mappings)
+            can, ok = canonicalize_smiles(s_clean, ignore_cistrans=True)
+            gt_canonical.append(can if ok and can else s)
+        except Exception:
+            gt_canonical.append(s)
+
     rewards = torch.zeros(total_seqs, device=device)
     sampled_smiles = []
     n_valid = 0
 
     for b in range(total_seqs):
         result = vocab.sequence_to_smiles(sampled_seqs_list[b])
-        pred_smiles = result.get('smiles', '')
+        # Apply postprocessing to predicted SMILES (same as _result_to_smiles_postprocess)
+        pred_smiles = _result_to_smiles_postprocess(result)
+        if pred_smiles is None:
+            pred_smiles = ''
         sampled_smiles.append(pred_smiles)
-        tanimoto = compute_tanimoto_similarity(pred_smiles, gt_expanded[b])
+        tanimoto = compute_tanimoto_similarity(pred_smiles, gt_canonical[b])
         rewards[b] = tanimoto
         if tanimoto > 0:
             n_valid += 1
@@ -3487,13 +3686,12 @@ def train_rl_finetune(
                 rl_loss_val = torch.tensor(0.0, device=device)
                 rl_reward = 0.0
                 if do_rl:
-                    # Encode a SUBSAMPLE of images for RL (no autocast — fp32 for stability)
+                    # Encode a SUBSAMPLE of images for RL (fp32 for stability)
+                    # Gradients flow through both encoder and decoder.
                     rl_images = images[:rl_subsample_actual]
-                    with torch.no_grad():
-                        img_features = actual_model.image_encoder(rl_images)
-                        img_features = actual_model.pos_enc_2d(img_features)
-                    # Detach: gradients flow through decoder only (REINFORCE)
-                    img_features = img_features.detach().float()
+                    img_features = actual_model.image_encoder(rl_images)
+                    img_features = actual_model.pos_enc_2d(img_features)
+                    img_features = img_features.float()
 
                     # Reconstruct GT SMILES for the subsampled images
                     gt_smiles_batch = []
@@ -3563,11 +3761,10 @@ def train_rl_finetune(
                 rl_loss_val = torch.tensor(0.0, device=device)
                 rl_reward = 0.0
                 if do_rl:
+                    # Gradients flow through both encoder and decoder.
                     rl_images = images[:rl_subsample_actual]
-                    with torch.no_grad():
-                        img_features = actual_model.image_encoder(rl_images)
-                        img_features = actual_model.pos_enc_2d(img_features)
-                    img_features = img_features.detach()
+                    img_features = actual_model.image_encoder(rl_images)
+                    img_features = actual_model.pos_enc_2d(img_features)
 
                     gt_smiles_batch = []
                     for b in range(rl_subsample_actual):
