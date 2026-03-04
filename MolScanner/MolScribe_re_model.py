@@ -3579,8 +3579,6 @@ def train_rl_finetune(
         train_iter = iter(train_loader)
 
         for _step in range(steps_in_epoch):
-
-        for _step in range(steps_in_epoch):
             try:
                 batch = next(train_iter)
             except StopIteration:
