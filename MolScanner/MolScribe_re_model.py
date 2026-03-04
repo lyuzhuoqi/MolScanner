@@ -966,15 +966,20 @@ class SequenceDecoder(nn.Module):
         # Positional encoding for sequence
         self.pos_encoder = nn.Embedding(max_seq_len, d_model)
         
-        # Transformer Decoder
+        # Transformer Decoder (Pre-Norm + GELU, matching original MolScribe)
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
-            batch_first=True
+            batch_first=True,
+            norm_first=True,
+            activation='gelu',
         )
-        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+        self.transformer_decoder = nn.TransformerDecoder(
+            decoder_layer, num_layers=num_layers,
+            norm=nn.LayerNorm(d_model),
+        )
         
         # Output head: predict next token in vocabulary
         self.output_head = nn.Linear(d_model, vocab_size)
@@ -1025,8 +1030,8 @@ class SequenceDecoder(nn.Module):
         # Flatten image features to sequence: [B, H*W, d_model]
         memory = img_features.flatten(2).permute(0, 2, 1)  # [B, H*W, d_model]
         
-        # Embed target tokens
-        tgt_emb = self.token_embedding(tgt_tokens)  # [B, T, d_model]
+        # Embed target tokens (scale by sqrt(d_model), matching original MolScribe)
+        tgt_emb = self.token_embedding(tgt_tokens) * math.sqrt(self.d_model)  # [B, T, d_model]
         
         # Add positional encoding (optimized: avoid expand by using broadcasting)
         positions = torch.arange(T, device=device)
@@ -1086,9 +1091,9 @@ class SequenceDecoder(nn.Module):
         B = new_token_ids.size(0)
         device = new_token_ids.device
 
-        # Embed the single new token  →  [B, 1, d_model]
+        # Embed the single new token  →  [B, 1, d_model] (scale by sqrt(d_model))
         pos = torch.full((B, 1), step_idx, dtype=torch.long, device=device)
-        h = self.token_embedding(new_token_ids.unsqueeze(1)) + self.pos_encoder(pos)
+        h = self.token_embedding(new_token_ids.unsqueeze(1)) * math.sqrt(self.d_model) + self.pos_encoder(pos)
 
         num_layers = len(self.transformer_decoder.layers)
         if cache is None:
@@ -1101,20 +1106,23 @@ class SequenceDecoder(nn.Module):
         for i, layer in enumerate(self.transformer_decoder.layers):
             lc = cache[i]
 
-            # --- Self-attention (post-norm, Q=new token, K/V grows) ---
+            # --- Pre-Norm self-attention (Q=new token, K/V grows) ---
+            h_normed = layer.norm1(h)
             sa_out, sa_k, sa_v = _mha_with_kv_cache(
-                layer.self_attn, h, h, lc['self_k'], lc['self_v'])
-            h = layer.norm1(h + layer.dropout1(sa_out))
+                layer.self_attn, h_normed, h_normed, lc['self_k'], lc['self_v'])
+            h = h + layer.dropout1(sa_out)
 
-            # --- Cross-attention (K/V=memory, projected once at step 0) ---
+            # --- Pre-Norm cross-attention (K/V=memory, projected once at step 0) ---
+            h_normed = layer.norm2(h)
             cross_new = memory if lc['cross_k'] is None else None
             ca_out, ca_k, ca_v = _mha_with_kv_cache(
-                layer.multihead_attn, h, cross_new, lc['cross_k'], lc['cross_v'])
-            h = layer.norm2(h + layer.dropout2(ca_out))
+                layer.multihead_attn, h_normed, cross_new, lc['cross_k'], lc['cross_v'])
+            h = h + layer.dropout2(ca_out)
 
-            # --- Feed-forward ---
-            ff = layer.linear2(layer.dropout(layer.activation(layer.linear1(h))))
-            h = layer.norm3(h + layer.dropout3(ff))
+            # --- Pre-Norm feed-forward (GELU) ---
+            h_normed = layer.norm3(h)
+            ff = layer.linear2(layer.dropout(layer.activation(layer.linear1(h_normed))))
+            h = h + layer.dropout3(ff)
 
             new_cache.append({
                 'self_k': sa_k, 'self_v': sa_v,
@@ -2800,7 +2808,6 @@ def train(
     start_epoch = 1
     best_val_acc = 0.0
     epochs_no_improve = 0
-    global_step = 0
     resume_log_dir = None
     
     if resume_from is not None and os.path.isfile(resume_from):
@@ -2812,40 +2819,29 @@ def train(
         actual_model = model.module if hasattr(model, 'module') else model
         actual_model.load_state_dict(ckpt['model_state_dict'])
         
-        # Load optimizer state (may be None if created from old-style checkpoint)
+        # Restore optimizer / scheduler / scaler
         if ckpt.get('optimizer_state_dict') is not None:
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        else:
-            if is_main_process():
-                print('  [!] Optimizer state not found in checkpoint — using fresh optimizer.')
-                print(f'      Fast-forwarding scheduler by {global_step} steps...')
-            # Fast-forward scheduler to match the global_step
-            for _ in range(global_step):
-                scheduler.step()
-        
-        # Load scheduler state
         if ckpt.get('scheduler_state_dict') is not None:
             scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-        
-        # Load scaler state
-        if scaler is not None and 'scaler_state_dict' in ckpt and ckpt['scaler_state_dict'] is not None:
+        if scaler is not None and ckpt.get('scaler_state_dict') is not None:
             scaler.load_state_dict(ckpt['scaler_state_dict'])
         
-        # Restore training state
+        # Restore training state — always resume from the next full epoch
         saved_epoch = ckpt.get('epoch', 0)
-        epoch_completed = ckpt.get('epoch_completed', False)  # default False for old checkpoints (intra-epoch saves)
-        start_epoch = saved_epoch + 1 if epoch_completed else saved_epoch
-        global_step = ckpt.get('global_step', 0)
+        start_epoch = saved_epoch + 1
         best_val_acc = ckpt.get('best_val_acc', 0.0)
         epochs_no_improve = ckpt.get('epochs_no_improve', 0)
         resume_log_dir = ckpt.get('log_dir', None)
         
         if is_main_process():
-            status = 'completed' if epoch_completed else 'interrupted'
-            print(f'  Checkpoint epoch {saved_epoch} ({status}), resuming from epoch {start_epoch}')
-            print(f'  global_step={global_step}, best_val_acc={best_val_acc:.4f}, epochs_no_improve={epochs_no_improve}')
+            print(f'  Loaded epoch {saved_epoch}, resuming from epoch {start_epoch}')
+            print(f'  best_val_acc={best_val_acc:.4f}, epochs_no_improve={epochs_no_improve}')
         del ckpt
         torch.cuda.empty_cache()
+    
+    # Recompute global_step from start_epoch (avoids drift from interrupted runs)
+    global_step = (start_epoch - 1) * steps_per_epoch
     
     # TensorBoard (only on rank 0)
     writer = None
@@ -2892,7 +2888,9 @@ def train(
         num_batches = 0
         
         steps_in_epoch = len(train_loader)
-        train_bar = tqdm(total=steps_in_epoch, desc=f'Epoch {epoch} [Train]', disable=not is_main_process())
+        train_bar = tqdm(total=steps_in_epoch,
+                         desc=f'Epoch {epoch} [Train]',
+                         disable=not is_main_process())
         train_iter = iter(train_loader)
         
         for _step in range(steps_in_epoch):
@@ -2968,7 +2966,7 @@ def train(
                 
                 scaler.scale(losses['total_loss']).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
@@ -2992,7 +2990,7 @@ def train(
                 )
                 
                 losses['total_loss'].backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
             
             scheduler.step()
@@ -3017,23 +3015,6 @@ def train(
                 writer.add_scalar('LR/decoder', current_lrs[1], global_step)
             
             train_bar.update(1)
-            
-            # ===== Periodic intra-epoch checkpoint (minimizes lost work on crash) =====
-            if is_main_process() and global_step % 500 == 0:
-                model_to_save = model.module if hasattr(model, 'module') else model
-                checkpoint_state = {
-                    'model_state_dict': model_to_save.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
-                    'epoch': epoch,
-                    'epoch_completed': False,
-                    'global_step': global_step,
-                    'best_val_acc': best_val_acc,
-                    'epochs_no_improve': epochs_no_improve,
-                    'log_dir': log_dir,
-                }
-                torch.save(checkpoint_state, os.path.join(save_path, 'checkpoint_resume.pth'))
         
         train_bar.close()
         
@@ -3072,15 +3053,13 @@ def train(
             # Save epoch checkpoint (model weights only, for easy standalone loading)
             torch.save(model_to_save.state_dict(), os.path.join(save_path, f'epoch_{epoch}.pth'))
             
-            # Save full training checkpoint for resume (includes optimizer/scheduler/scaler state)
+            # Save full training checkpoint for resume
             checkpoint_state = {
                 'model_state_dict': model_to_save.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
                 'epoch': epoch,
-                'epoch_completed': True,
-                'global_step': global_step,
                 'best_val_acc': best_val_acc,
                 'epochs_no_improve': epochs_no_improve,
                 'log_dir': log_dir,
@@ -3513,7 +3492,6 @@ def train_rl_finetune(
     start_epoch = 1
     best_val_acc = 0.0
     epochs_no_improve = 0
-    global_step = 0
     rl_baseline_ema = 0.0  # exponential moving average of rewards
     resume_log_dir = None
 
@@ -3522,27 +3500,31 @@ def train_rl_finetune(
             print(f'Resuming RL finetuning from {resume_from}')
         ckpt = torch.load(resume_from, map_location=device, weights_only=False)
         actual_model.load_state_dict(ckpt['model_state_dict'])
+        
+        # Restore optimizer / scheduler / scaler
         if ckpt.get('optimizer_state_dict') is not None:
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         if ckpt.get('scheduler_state_dict') is not None:
             scheduler.load_state_dict(ckpt['scheduler_state_dict'])
         if scaler is not None and ckpt.get('scaler_state_dict') is not None:
             scaler.load_state_dict(ckpt['scaler_state_dict'])
+        
+        # Restore training state — always resume from the next full epoch
         saved_epoch = ckpt.get('epoch', 0)
-        epoch_completed = ckpt.get('epoch_completed', False)
-        start_epoch = saved_epoch + 1 if epoch_completed else saved_epoch
-        global_step = ckpt.get('global_step', 0)
+        start_epoch = saved_epoch + 1
         best_val_acc = ckpt.get('best_val_acc', 0.0)
         epochs_no_improve = ckpt.get('epochs_no_improve', 0)
         rl_baseline_ema = ckpt.get('rl_baseline_ema', 0.0)
         resume_log_dir = ckpt.get('log_dir', None)
+        
         if is_main_process():
-            status = 'completed' if epoch_completed else 'interrupted'
-            print(f'  Epoch {saved_epoch} ({status}), resuming from epoch {start_epoch}')
-            print(f'  global_step={global_step}, best_val_acc={best_val_acc:.4f}, '
-                  f'rl_baseline_ema={rl_baseline_ema:.4f}')
+            print(f'  Loaded epoch {saved_epoch}, resuming from epoch {start_epoch}')
+            print(f'  best_val_acc={best_val_acc:.4f}, rl_baseline_ema={rl_baseline_ema:.4f}')
         del ckpt
         torch.cuda.empty_cache()
+    
+    # Recompute global_step from start_epoch
+    global_step = (start_epoch - 1) * steps_per_epoch
 
     # TensorBoard
     writer = None
@@ -3724,7 +3706,7 @@ def train_rl_finetune(
 
                 # Clip & step (accumulated MLE + RL gradients)
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 scaler.step(optimizer)
                 scaler.update()
 
@@ -3789,7 +3771,7 @@ def train_rl_finetune(
                     del img_features, rl_loss
                     rl_baseline_ema = 0.9 * rl_baseline_ema + 0.1 * rl_reward
 
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
 
                 mle_loss_val = (token_loss_weight * mle_losses['token_loss'].item()
@@ -3832,24 +3814,6 @@ def train_rl_finetune(
                 writer.add_scalar('LR/decoder', current_lrs[1], global_step)
 
             train_bar.update(1)
-
-            # Periodic checkpoint
-            if is_main_process() and global_step % 500 == 0:
-                model_to_save = model.module if hasattr(model, 'module') else model
-                ckpt_state = {
-                    'model_state_dict': model_to_save.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
-                    'epoch': epoch,
-                    'epoch_completed': False,
-                    'global_step': global_step,
-                    'best_val_acc': best_val_acc,
-                    'epochs_no_improve': epochs_no_improve,
-                    'rl_baseline_ema': rl_baseline_ema,
-                    'log_dir': log_dir,
-                }
-                torch.save(ckpt_state, os.path.join(save_path, 'checkpoint_resume.pth'))
 
         train_bar.close()
 
@@ -3895,8 +3859,6 @@ def train_rl_finetune(
                 'scheduler_state_dict': scheduler.state_dict(),
                 'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
                 'epoch': epoch,
-                'epoch_completed': True,
-                'global_step': global_step,
                 'best_val_acc': best_val_acc,
                 'epochs_no_improve': epochs_no_improve,
                 'rl_baseline_ema': rl_baseline_ema,
