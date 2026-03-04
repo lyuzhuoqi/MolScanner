@@ -67,7 +67,7 @@ from chemistry import (
     _replace_functional_group, _expand_functional_group,
 )
 from rdkit import Chem
-from rdkit.Chem import AllChem
+from rdkit.Chem import AllChem, Draw
 from rdkit import DataStructs
 from SmilesPE.pretokenizer import atomwise_tokenizer
 
@@ -3173,6 +3173,53 @@ def train(
     return []
 
 
+# ======================== Reward Helpers ========================
+
+def _levenshtein_similarity(s1: str, s2: str) -> float:
+    """Normalized Levenshtein similarity: 1 − edit_distance / max(|s1|, |s2|).
+
+    Returns a value in [0, 1] where 1 means identical strings.
+    Provides token-level feedback (each correct/incorrect character matters),
+    unlike Tanimoto which is insensitive to small edits once fingerprints match.
+    """
+    if not s1 and not s2:
+        return 1.0
+    if not s1 or not s2:
+        return 0.0
+    max_len = max(len(s1), len(s2))
+    # Ensure s1 is the longer string for DP efficiency
+    if len(s1) < len(s2):
+        s1, s2 = s2, s1
+    prev = list(range(len(s2) + 1))
+    for i, c1 in enumerate(s1):
+        curr = [i + 1]
+        for j, c2 in enumerate(s2):
+            curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (c1 != c2)))
+        prev = curr
+    return 1.0 - prev[-1] / max_len
+
+
+def _fast_render_smiles(smiles: str) -> Tuple[np.ndarray, bool]:
+    """Render SMILES to a numpy image using RDKit Draw (~5 ms/call).
+
+    Much faster than Indigo-based generate_image_from_smiles, suitable for
+    batch rendering during RL training.  Returns (H×W×3 uint8, success).
+    Colour order is irrelevant because inference_transforms applies ToGray.
+    """
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return _blank_image(), False
+        img_pil = Draw.MolToImage(mol, size=(300, 300))
+        img_np = np.array(img_pil)
+        # Drop alpha channel if present
+        if img_np.ndim == 3 and img_np.shape[2] == 4:
+            img_np = img_np[:, :, :3]
+        return img_np, True
+    except Exception:
+        return _blank_image(), False
+
+
 # ======================== REINFORCE Composite Reward Loss ========================
 
 def compute_reinforce_tanimoto_loss(
@@ -3189,18 +3236,28 @@ def compute_reinforce_tanimoto_loss(
     reward_validity_weight: float = 0.1,
     reward_tanimoto_weight: float = 0.5,
     reward_exact_match_weight: float = 0.4,
+    # ===== Reward mode =====
+    reward_mode: str = 'tanimoto',
 ) -> Tuple[torch.Tensor, Dict]:
     """REINFORCE-based composite reward loss for MolScribe.
 
     Treats the autoregressive decoder as a stochastic policy π_θ that
     emits tokens.  The reward is a weighted combination of three signals:
 
-        R = w_v · 𝟙[valid SMILES] + w_t · Tanimoto(pred, gt) + w_e · 𝟙[exact match]
+        R = w_v · 𝟙[valid SMILES] + w_sim · Similarity(pred, gt) + w_e · 𝟙[exact match]
 
-    This composite reward provides gradient signal at three granularities:
-      - Validity bonus: coarse signal even for badly wrong predictions
-      - Tanimoto: smooth, continuous similarity signal
-      - Exact match: sharp bonus for perfect predictions
+    where Similarity depends on ``reward_mode``:
+
+      - ``'tanimoto'``: Morgan-fingerprint Tanimoto similarity (original).
+      - ``'edit_distance'``: Normalized Levenshtein similarity on canonical
+        SMILES.  Provides finer-grained, token-level gradient signal.
+      - ``'visual'``: Cycle-consistency visual reward.  Predicted SMILES is
+        rendered to an image with RDKit, encoded by the *same* Swin-B
+        encoder, and compared to the GT image features via cosine
+        similarity after global average pooling.
+
+    ``reward_tanimoto_weight`` controls the weight of the main similarity
+    signal regardless of mode (kept for backward compatibility).
 
     L_RL = −(R − baseline) · Σ_t log P(a_t | a_{1:t−1}, image; θ)
 
@@ -3230,13 +3287,16 @@ def compute_reinforce_tanimoto_loss(
         temperature: Softmax temperature for exploration.
         n_samples: Number of samples per image for variance reduction.
         reward_validity_weight: Weight for the valid-SMILES indicator reward.
-        reward_tanimoto_weight: Weight for the Tanimoto similarity reward.
+        reward_tanimoto_weight: Weight for the main similarity signal
+            (Tanimoto / edit-distance / visual cosine-sim depending on mode).
         reward_exact_match_weight: Weight for the exact-match indicator reward.
+        reward_mode: One of ``'tanimoto'``, ``'edit_distance'``, ``'visual'``.
 
     Returns:
         loss: Scalar tensor with gradient graph (through decoder params).
-        info: Dict with 'mean_reward', 'mean_log_prob', 'sampled_smiles', 'n_valid',
-              'mean_tanimoto', 'exact_matches', 'valid_smiles_count'.
+        info: Dict with 'mean_reward', 'mean_log_prob', 'sampled_smiles',
+              'n_valid', 'mean_similarity', 'exact_matches',
+              'valid_smiles_count', plus mode-specific keys.
     """
     B = img_features.size(0)
     total_seqs = B * n_samples
@@ -3256,7 +3316,7 @@ def compute_reinforce_tanimoto_loss(
             img_features_expanded, max_len, device, temperature
         )
 
-    # ===== Phase 2: Compute Tanimoto rewards (CPU, non-differentiable) =====
+    # ===== Phase 2: Compute rewards (mode-dependent, non-differentiable) =====
     # Canonicalize GT SMILES: remove atom mapping + functional group handling
     gt_canonical = []
     for s in gt_expanded:
@@ -3272,38 +3332,109 @@ def compute_reinforce_tanimoto_loss(
         except Exception:
             gt_canonical.append(s)
 
-    rewards = torch.zeros(total_seqs, device=device)
+    # Extract predicted SMILES for all samples
     sampled_smiles = []
-    n_valid = 0
-    n_valid_smiles = 0
-    n_exact = 0
-    tanimoto_sum = 0.0
-
     for b in range(total_seqs):
         result = vocab.sequence_to_smiles(sampled_seqs_list[b])
-        # Apply postprocessing to predicted SMILES (same as _result_to_smiles_postprocess)
         pred_smiles = _result_to_smiles_postprocess(result)
         if pred_smiles is None:
             pred_smiles = ''
         sampled_smiles.append(pred_smiles)
 
-        # --- Composite reward: validity + tanimoto + exact match ---
-        is_valid = pred_smiles != '' and Chem.MolFromSmiles(pred_smiles) is not None
-        tanimoto = compute_tanimoto_similarity(pred_smiles, gt_canonical[b])
-        is_exact = pred_smiles != '' and pred_smiles == gt_canonical[b]
-
-        r = (reward_validity_weight * float(is_valid)
-             + reward_tanimoto_weight * tanimoto
-             + reward_exact_match_weight * float(is_exact))
-        rewards[b] = r
-
-        if tanimoto > 0:
-            n_valid += 1
+    # Per-sample validity and exact match (shared across all modes)
+    is_valid_list = []
+    is_exact_list = []
+    n_valid_smiles = 0
+    n_exact = 0
+    for b in range(total_seqs):
+        is_valid = sampled_smiles[b] != '' and Chem.MolFromSmiles(sampled_smiles[b]) is not None
+        is_exact = sampled_smiles[b] != '' and sampled_smiles[b] == gt_canonical[b]
+        is_valid_list.append(is_valid)
+        is_exact_list.append(is_exact)
         if is_valid:
             n_valid_smiles += 1
         if is_exact:
             n_exact += 1
-        tanimoto_sum += tanimoto
+
+    # Compute main similarity signal based on reward_mode
+    rewards = torch.zeros(total_seqs, device=device)
+    similarity_sum = 0.0
+    extra_info: Dict = {}
+
+    if reward_mode == 'tanimoto':
+        # ----- Tanimoto (Morgan fingerprint) similarity -----
+        for b in range(total_seqs):
+            tanimoto = compute_tanimoto_similarity(sampled_smiles[b], gt_canonical[b])
+            r = (reward_validity_weight * float(is_valid_list[b])
+                 + reward_tanimoto_weight * tanimoto
+                 + reward_exact_match_weight * float(is_exact_list[b]))
+            rewards[b] = r
+            similarity_sum += tanimoto
+        extra_info['mean_tanimoto'] = similarity_sum / max(total_seqs, 1)
+
+    elif reward_mode == 'edit_distance':
+        # ----- Normalised Levenshtein similarity on canonical SMILES -----
+        for b in range(total_seqs):
+            edit_sim = _levenshtein_similarity(sampled_smiles[b], gt_canonical[b])
+            r = (reward_validity_weight * float(is_valid_list[b])
+                 + reward_tanimoto_weight * edit_sim
+                 + reward_exact_match_weight * float(is_exact_list[b]))
+            rewards[b] = r
+            similarity_sum += edit_sim
+        extra_info['mean_edit_similarity'] = similarity_sum / max(total_seqs, 1)
+
+    elif reward_mode == 'visual':
+        # ----- Cycle-consistency visual reward -----
+        # GT feature vectors via global average pooling (detached)
+        gt_feat = img_features_expanded.detach().float().mean(dim=[2, 3])  # [total_seqs, d_model]
+
+        # Render all predicted SMILES to images, preprocess
+        rendered_tensors = []
+        render_success_count = 0
+        for smi in sampled_smiles:
+            img_np, ok = _fast_render_smiles(smi)
+            rendered_tensors.append(
+                model.inference_transforms(image=img_np)['image']
+            )
+            if ok:
+                render_success_count += 1
+
+        rendered_batch = torch.stack(rendered_tensors).to(device)  # [total_seqs, 3, H, W]
+
+        # Encode rendered images in chunks (no grad, memory-safe)
+        pred_feat_chunks = []
+        _encode_chunk = 32
+        with torch.no_grad():
+            for i in range(0, total_seqs, _encode_chunk):
+                chunk = rendered_batch[i:i + _encode_chunk]
+                feat = model.image_encoder(chunk)
+                feat = model.pos_enc_2d(feat)
+                feat = feat.float().mean(dim=[2, 3])  # [chunk_sz, d_model]
+                pred_feat_chunks.append(feat)
+        pred_feat = torch.cat(pred_feat_chunks, dim=0)  # [total_seqs, d_model]
+
+        # Cosine similarity, clamped to [0, 1]
+        cos_sims = F.cosine_similarity(gt_feat, pred_feat, dim=1).clamp(min=0.0)
+
+        for b in range(total_seqs):
+            visual_sim = cos_sims[b].item()
+            r = (reward_validity_weight * float(is_valid_list[b])
+                 + reward_tanimoto_weight * visual_sim
+                 + reward_exact_match_weight * float(is_exact_list[b]))
+            rewards[b] = r
+            similarity_sum += visual_sim
+
+        extra_info['mean_visual_similarity'] = similarity_sum / max(total_seqs, 1)
+        extra_info['render_success'] = render_success_count
+        del rendered_batch, pred_feat, gt_feat  # free memory
+
+    else:
+        raise ValueError(f"Unknown reward_mode='{reward_mode}'. "
+                         f"Choose from 'tanimoto', 'edit_distance', 'visual'.")
+
+    # Legacy: number of samples with positive similarity
+    n_valid = sum(1 for b in range(total_seqs)
+                  if rewards[b].item() > reward_validity_weight + 1e-6)
 
     # ===== Phase 3: One teacher-forced forward pass to get log P(sampled) =====
     # Pad sampled sequences to the same length
@@ -3348,10 +3479,12 @@ def compute_reinforce_tanimoto_loss(
         'mean_log_prob': log_probs_sum.mean().item(),
         'sampled_smiles': sampled_smiles[:B],
         'n_valid': n_valid,
-        'mean_tanimoto': tanimoto_sum / max(total_seqs, 1),
+        'mean_similarity': similarity_sum / max(total_seqs, 1),
         'exact_matches': n_exact,
         'valid_smiles_count': n_valid_smiles,
+        'reward_mode': reward_mode,
     }
+    info.update(extra_info)  # mode-specific keys (mean_tanimoto, mean_edit_similarity, etc.)
 
     return reinforce_loss, info
 
@@ -3405,6 +3538,8 @@ def train_rl_finetune(
     reward_validity_weight: float = 0.1,
     reward_tanimoto_weight: float = 0.5,
     reward_exact_match_weight: float = 0.4,
+    # ===== Reward mode =====
+    reward_mode: str = 'tanimoto',
     # ===== optimization =====
     num_workers: int = 4,
     use_amp: bool = True,
@@ -3422,9 +3557,11 @@ def train_rl_finetune(
     where α(t) is linearly annealed from 0 → alpha_rl_max over
     alpha_rl_warmup_epochs, then held constant.
 
-    The REINFORCE reward is a weighted composite of three signals:
+    The REINFORCE reward depends on ``reward_mode``:
 
-        R = w_v · 𝟙[valid SMILES] + w_t · Tanimoto(pred, gt) + w_e · 𝟙[exact match]
+      - ``'tanimoto'``:  R = w_v·𝟙[valid] + w_sim·Tanimoto + w_e·𝟙[exact]
+      - ``'edit_distance'``: R = w_v·𝟙[valid] + w_sim·LevenshteinSim + w_e·𝟙[exact]
+      - ``'visual'``:  R = w_v·𝟙[valid] + w_sim·CosineSim(enc(render(pred)), enc(gt)) + w_e·𝟙[exact]
 
     This provides gradient signal at three granularities:
       - Validity bonus: coarse signal even for badly wrong predictions
@@ -3478,7 +3615,8 @@ def train_rl_finetune(
               f'every_n={rl_every_n_steps}, temp={rl_temperature}, n_samples={rl_n_samples}, '
               f'subsample={rl_subsample}, max_len={rl_max_len}')
         print(f'Composite reward weights: validity={reward_validity_weight}, '
-              f'tanimoto={reward_tanimoto_weight}, exact_match={reward_exact_match_weight}')
+              f'similarity={reward_tanimoto_weight}, exact_match={reward_exact_match_weight}')
+        print(f'Reward mode: {reward_mode}')
         print(f'Loss weights: token={token_loss_weight}, bond={bond_loss_weight}')
         print(f'Pretrained model: {pretrained_path}')
 
@@ -3806,6 +3944,7 @@ def train_rl_finetune(
                         reward_validity_weight=reward_validity_weight,
                         reward_tanimoto_weight=reward_tanimoto_weight,
                         reward_exact_match_weight=reward_exact_match_weight,
+                        reward_mode=reward_mode,
                     )
                     rl_loss_val = rl_loss
                     rl_reward = rl_info['mean_reward']
@@ -3881,6 +4020,7 @@ def train_rl_finetune(
                         reward_validity_weight=reward_validity_weight,
                         reward_tanimoto_weight=reward_tanimoto_weight,
                         reward_exact_match_weight=reward_exact_match_weight,
+                        reward_mode=reward_mode,
                     )
                     rl_loss_val = rl_loss
                     rl_reward = rl_info['mean_reward']
@@ -3924,7 +4064,15 @@ def train_rl_finetune(
                 if do_rl:
                     writer.add_scalar('Loss/rl_reinforce', rl_loss_val.item(), global_step)
                     writer.add_scalar('RL/reward_composite', rl_reward, global_step)
-                    writer.add_scalar('RL/reward_tanimoto', rl_info.get('mean_tanimoto', 0.0), global_step)
+                    writer.add_scalar('RL/similarity', rl_info.get('mean_similarity', 0.0), global_step)
+                    # Mode-specific similarity metrics
+                    if reward_mode == 'tanimoto':
+                        writer.add_scalar('RL/reward_tanimoto', rl_info.get('mean_tanimoto', 0.0), global_step)
+                    elif reward_mode == 'edit_distance':
+                        writer.add_scalar('RL/reward_edit_sim', rl_info.get('mean_edit_similarity', 0.0), global_step)
+                    elif reward_mode == 'visual':
+                        writer.add_scalar('RL/reward_visual_sim', rl_info.get('mean_visual_similarity', 0.0), global_step)
+                        writer.add_scalar('RL/render_success', rl_info.get('render_success', 0), global_step)
                     writer.add_scalar('RL/exact_matches', rl_info.get('exact_matches', 0), global_step)
                     writer.add_scalar('RL/valid_smiles', rl_info.get('valid_smiles_count', 0), global_step)
                     writer.add_scalar('RL/baseline_ema', rl_baseline_ema, global_step)
