@@ -3,7 +3,9 @@ RL Finetuning Launcher for MolScribe_re
 =======================================
 
 Finetunes a pretrained MolScribe model with a combined loss:
-    L_total = w_t·L_token + w_b·L_bond + α(t) · L_REINFORCE_Tanimoto
+    L_total = w_t·L_token + w_b·L_bond + α(t) · L_REINFORCE_composite
+
+    Composite reward: R = w_v·𝟙[valid] + w_t·Tanimoto + w_e·𝟙[exact match]
 
 Usage:
     # Multi-GPU (4x L40)
@@ -118,6 +120,12 @@ if __name__ == '__main__':
         rl_temperature=0.7,      # sampling temperature (lower = less noisy)
         rl_n_samples=8,          # samples per image (set >1 for self-critical baseline)
         rl_subsample=32,         # max images per batch for RL sampling (memory cap)
+
+        # ===== Composite reward weights =====
+        # R = w_v·𝟙[valid] + w_t·Tanimoto + w_e·𝟙[exact match]
+        reward_validity_weight=0.1,    # coarse signal for invalid SMILES
+        reward_tanimoto_weight=0.5,    # smooth continuous similarity
+        reward_exact_match_weight=0.4, # sharp bonus for perfect predictions
 
         # resume
         resume_from=resume_path,

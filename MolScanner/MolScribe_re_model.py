@@ -572,7 +572,7 @@ class MoleculeDataset(Dataset):
         self.img_transforms = A.Compose(self.img_transforms_list)
         # 3. Final transforms (after padding, no keypoints needed)
         self.post_transforms = A.Compose([
-            A.Resize(height=self.image_size[0], width=self.image_size[1], interpolation=cv2.INTER_LINEAR),
+            AdaptiveResize(height=self.image_size[0], width=self.image_size[1]),  # INTER_LINEAR↑ / INTER_AREA↓
             A.ToGray(num_output_channels=3),  # Keep 3 channels for pretrained backbone
             A.Normalize(),  # ImageNet normalization
             ToTensorV2(),
@@ -1347,6 +1347,72 @@ def extract_atom_indices_from_tokens(
 
 # ======================== CropWhite for Inference ========================
 
+class AdaptiveLongestMaxSize(A.ImageOnlyTransform):
+    """LongestMaxSize with adaptive interpolation.
+    
+    Uses INTER_LINEAR (bilinear) when upscaling and INTER_AREA when downscaling,
+    matching OpenCV best-practice for each direction.
+    """
+    
+    def __init__(self, max_size, p=1.0):
+        super().__init__(p=p)
+        self.max_size = max_size
+
+    def apply(self, img, **params):
+        h, w = img.shape[:2]
+        longest = max(h, w)
+        if longest == self.max_size:
+            return img
+        scale = self.max_size / longest
+        new_h = int(h * scale)
+        new_w = int(w * scale)
+        interpolation = cv2.INTER_AREA if longest > self.max_size else cv2.INTER_LINEAR
+        return cv2.resize(img, (new_w, new_h), interpolation=interpolation)
+
+    def get_transform_init_args_names(self):
+        return ('max_size',)
+
+
+class AdaptiveResize(A.DualTransform):
+    """Resize with adaptive interpolation.
+    
+    Uses INTER_LINEAR (bilinear) when upscaling and INTER_AREA when downscaling,
+    matching OpenCV best-practice for each direction.
+    Supports keypoint tracking (DualTransform).
+    """
+
+    def __init__(self, height, width, p=1.0):
+        super().__init__(p=p)
+        self.height = height
+        self.width = width
+
+    @property
+    def targets_as_params(self):
+        return ["image"]
+
+    def get_params_dependent_on_data(self, params, data):
+        img = data["image"]
+        h, w = img.shape[:2]
+        interpolation = cv2.INTER_AREA if (h > self.height or w > self.width) else cv2.INTER_LINEAR
+        return {
+            "scale_x": self.width / w,
+            "scale_y": self.height / h,
+            "interpolation": interpolation,
+        }
+
+    def apply(self, img, scale_x=1, scale_y=1, interpolation=cv2.INTER_LINEAR, **params):
+        return cv2.resize(img, (self.width, self.height), interpolation=interpolation)
+
+    def apply_to_keypoints(self, keypoints, scale_x=1, scale_y=1, **params):
+        result = keypoints.copy()
+        result[:, 0] *= scale_x
+        result[:, 1] *= scale_y
+        return result
+
+    def get_transform_init_args_names(self):
+        return ('height', 'width')
+
+
 class CropWhiteInference(A.ImageOnlyTransform):
     """Crop white borders from images during inference.
     
@@ -1447,7 +1513,7 @@ class MolScribeModel(nn.Module):
         # Inference transform: crop white borders, resize with padding
         self.inference_transform_list = [
             CropWhiteInference(pad=5),
-            A.LongestMaxSize(max_size=self.image_size[0], interpolation=cv2.INTER_LINEAR),
+            AdaptiveLongestMaxSize(max_size=self.image_size[0]),  # INTER_LINEAR↑ / INTER_AREA↓
             A.PadIfNeeded(
                 min_height=self.image_size[0], 
                 min_width=self.image_size[1], 
@@ -3105,7 +3171,7 @@ def train(
     return []
 
 
-# ======================== REINFORCE Tanimoto Loss ========================
+# ======================== REINFORCE Composite Reward Loss ========================
 
 def compute_reinforce_tanimoto_loss(
     model: MolScribeModel,
@@ -3117,12 +3183,22 @@ def compute_reinforce_tanimoto_loss(
     baseline: float = 0.0,
     temperature: float = 1.0,
     n_samples: int = 1,
+    # ===== Composite reward weights =====
+    reward_validity_weight: float = 0.1,
+    reward_tanimoto_weight: float = 0.5,
+    reward_exact_match_weight: float = 0.4,
 ) -> Tuple[torch.Tensor, Dict]:
-    """REINFORCE-based Tanimoto similarity loss for MolScribe.
+    """REINFORCE-based composite reward loss for MolScribe.
 
     Treats the autoregressive decoder as a stochastic policy π_θ that
-    emits tokens.  The Tanimoto similarity between a sampled SMILES and
-    the ground truth becomes a reward signal R.
+    emits tokens.  The reward is a weighted combination of three signals:
+
+        R = w_v · 𝟙[valid SMILES] + w_t · Tanimoto(pred, gt) + w_e · 𝟙[exact match]
+
+    This composite reward provides gradient signal at three granularities:
+      - Validity bonus: coarse signal even for badly wrong predictions
+      - Tanimoto: smooth, continuous similarity signal
+      - Exact match: sharp bonus for perfect predictions
 
     L_RL = −(R − baseline) · Σ_t log P(a_t | a_{1:t−1}, image; θ)
 
@@ -3151,10 +3227,14 @@ def compute_reinforce_tanimoto_loss(
         baseline: Constant baseline (overridden by self-critical when n_samples>1).
         temperature: Softmax temperature for exploration.
         n_samples: Number of samples per image for variance reduction.
+        reward_validity_weight: Weight for the valid-SMILES indicator reward.
+        reward_tanimoto_weight: Weight for the Tanimoto similarity reward.
+        reward_exact_match_weight: Weight for the exact-match indicator reward.
 
     Returns:
         loss: Scalar tensor with gradient graph (through decoder params).
-        info: Dict with 'mean_reward', 'mean_log_prob', 'sampled_smiles', 'n_valid'.
+        info: Dict with 'mean_reward', 'mean_log_prob', 'sampled_smiles', 'n_valid',
+              'mean_tanimoto', 'exact_matches', 'valid_smiles_count'.
     """
     B = img_features.size(0)
     total_seqs = B * n_samples
@@ -3193,6 +3273,9 @@ def compute_reinforce_tanimoto_loss(
     rewards = torch.zeros(total_seqs, device=device)
     sampled_smiles = []
     n_valid = 0
+    n_valid_smiles = 0
+    n_exact = 0
+    tanimoto_sum = 0.0
 
     for b in range(total_seqs):
         result = vocab.sequence_to_smiles(sampled_seqs_list[b])
@@ -3201,10 +3284,24 @@ def compute_reinforce_tanimoto_loss(
         if pred_smiles is None:
             pred_smiles = ''
         sampled_smiles.append(pred_smiles)
+
+        # --- Composite reward: validity + tanimoto + exact match ---
+        is_valid = pred_smiles != '' and Chem.MolFromSmiles(pred_smiles) is not None
         tanimoto = compute_tanimoto_similarity(pred_smiles, gt_canonical[b])
-        rewards[b] = tanimoto
+        is_exact = pred_smiles != '' and pred_smiles == gt_canonical[b]
+
+        r = (reward_validity_weight * float(is_valid)
+             + reward_tanimoto_weight * tanimoto
+             + reward_exact_match_weight * float(is_exact))
+        rewards[b] = r
+
         if tanimoto > 0:
             n_valid += 1
+        if is_valid:
+            n_valid_smiles += 1
+        if is_exact:
+            n_exact += 1
+        tanimoto_sum += tanimoto
 
     # ===== Phase 3: One teacher-forced forward pass to get log P(sampled) =====
     # Pad sampled sequences to the same length
@@ -3249,6 +3346,9 @@ def compute_reinforce_tanimoto_loss(
         'mean_log_prob': log_probs_sum.mean().item(),
         'sampled_smiles': sampled_smiles[:B],
         'n_valid': n_valid,
+        'mean_tanimoto': tanimoto_sum / max(total_seqs, 1),
+        'exact_matches': n_exact,
+        'valid_smiles_count': n_valid_smiles,
     }
 
     return reinforce_loss, info
@@ -3299,6 +3399,10 @@ def train_rl_finetune(
     rl_temperature: float = 0.8,
     rl_n_samples: int = 1,
     rl_subsample: int = 16,
+    # ===== Composite reward weights =====
+    reward_validity_weight: float = 0.1,
+    reward_tanimoto_weight: float = 0.5,
+    reward_exact_match_weight: float = 0.4,
     # ===== optimization =====
     num_workers: int = 4,
     use_amp: bool = True,
@@ -3307,7 +3411,7 @@ def train_rl_finetune(
     # ===== resume =====
     resume_from: Optional[str] = None,
 ) -> List[float]:
-    """RL finetuning loop: MLE + REINFORCE Tanimoto loss with DDP support.
+    """RL finetuning loop: MLE + REINFORCE composite reward loss with DDP support.
 
     Loads a pretrained MolScribe model and finetunes it with a combined loss:
 
@@ -3316,7 +3420,15 @@ def train_rl_finetune(
     where α(t) is linearly annealed from 0 → alpha_rl_max over
     alpha_rl_warmup_epochs, then held constant.
 
-    The REINFORCE loss uses Tanimoto similarity as the reward signal.
+    The REINFORCE reward is a weighted composite of three signals:
+
+        R = w_v · 𝟙[valid SMILES] + w_t · Tanimoto(pred, gt) + w_e · 𝟙[exact match]
+
+    This provides gradient signal at three granularities:
+      - Validity bonus: coarse signal even for badly wrong predictions
+      - Tanimoto: smooth, continuous similarity signal
+      - Exact match: sharp bonus for perfect predictions
+
     To manage the cost of autoregressive sampling, RL loss is computed
     only every ``rl_every_n_steps`` MLE steps.
 
@@ -3331,6 +3443,9 @@ def train_rl_finetune(
         rl_max_len: Max sequence length for RL autoregressive sampling.
         rl_temperature: Sampling temperature for RL exploration.
         rl_n_samples: Number of samples per image in REINFORCE (>1 enables self-critical).
+        reward_validity_weight: Weight for valid-SMILES indicator in reward.
+        reward_tanimoto_weight: Weight for Tanimoto similarity in reward.
+        reward_exact_match_weight: Weight for exact-match indicator in reward.
         (other args same as train())
     """
     # ===== DDP setup =====
@@ -3360,6 +3475,8 @@ def train_rl_finetune(
         print(f'RL config: alpha_rl_max={alpha_rl_max}, warmup={alpha_rl_warmup_epochs}ep, '
               f'every_n={rl_every_n_steps}, temp={rl_temperature}, n_samples={rl_n_samples}, '
               f'subsample={rl_subsample}, max_len={rl_max_len}')
+        print(f'Composite reward weights: validity={reward_validity_weight}, '
+              f'tanimoto={reward_tanimoto_weight}, exact_match={reward_exact_match_weight}')
         print(f'Loss weights: token={token_loss_weight}, bond={bond_loss_weight}')
         print(f'Pretrained model: {pretrained_path}')
 
@@ -3684,6 +3801,9 @@ def train_rl_finetune(
                         baseline=rl_baseline_ema,
                         temperature=rl_temperature,
                         n_samples=rl_n_samples,
+                        reward_validity_weight=reward_validity_weight,
+                        reward_tanimoto_weight=reward_tanimoto_weight,
+                        reward_exact_match_weight=reward_exact_match_weight,
                     )
                     rl_loss_val = rl_loss
                     rl_reward = rl_info['mean_reward']
@@ -3756,6 +3876,9 @@ def train_rl_finetune(
                         baseline=rl_baseline_ema,
                         temperature=rl_temperature,
                         n_samples=rl_n_samples,
+                        reward_validity_weight=reward_validity_weight,
+                        reward_tanimoto_weight=reward_tanimoto_weight,
+                        reward_exact_match_weight=reward_exact_match_weight,
                     )
                     rl_loss_val = rl_loss
                     rl_reward = rl_info['mean_reward']
@@ -3798,7 +3921,10 @@ def train_rl_finetune(
                 writer.add_scalar('Loss/train_bond', mle_losses['bond_loss'].item(), global_step)
                 if do_rl:
                     writer.add_scalar('Loss/rl_reinforce', rl_loss_val.item(), global_step)
-                    writer.add_scalar('RL/reward_tanimoto', rl_reward, global_step)
+                    writer.add_scalar('RL/reward_composite', rl_reward, global_step)
+                    writer.add_scalar('RL/reward_tanimoto', rl_info.get('mean_tanimoto', 0.0), global_step)
+                    writer.add_scalar('RL/exact_matches', rl_info.get('exact_matches', 0), global_step)
+                    writer.add_scalar('RL/valid_smiles', rl_info.get('valid_smiles_count', 0), global_step)
                     writer.add_scalar('RL/baseline_ema', rl_baseline_ema, global_step)
                     writer.add_scalar('RL/alpha', current_alpha, global_step)
                 current_lrs = scheduler.get_last_lr()

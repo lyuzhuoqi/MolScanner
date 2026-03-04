@@ -1,15 +1,26 @@
 from MolScribe_re_model import MolScannerVocab, MolScribeModel, evaluate_benchmarks
 from pathlib import Path
+import argparse
 import json
+import os
 
 if __name__ == '__main__':
-    proj_dir = Path.home() / "projects" / "Markush"
+    parser = argparse.ArgumentParser(description='Evaluate MolScribe model on benchmarks')
+    parser.add_argument('--gpu', type=str, default='0',
+                        help='Comma-separated GPU ids to use, e.g. "0", "1", "0,1" (default: "0")')
+    args = parser.parse_args()
+
+    os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    device = 'cuda'
+
+    proj_dir = Path.home() / "zqlyu" / "projects" / "MolScanner"
     data_dir = proj_dir / "data"
 
     vocab = MolScannerVocab(n_bins=64)
     model = MolScribeModel(vocab=vocab, backbone='swin_b', pretrained=True)
-    checkpoint = 'best'
-    model.load_model(str(proj_dir / "MolScanner" / "models" / "MolScribe_re" / f"{checkpoint}.pth"), device='cuda')
+    checkpoint = '20260226_edge_padding_finished'
+    model.load_model(str(proj_dir / "MolScanner" / "models" / "MolScribe_re" / f"{checkpoint}.pth"), device=device)
 
     benchmarks = [
         {'name': 'indigo', 'benchmark_dir': str(data_dir / "benchmark/synthetic/indigo"), 'csv_path': str(data_dir / "benchmark/synthetic/indigo.csv")},
