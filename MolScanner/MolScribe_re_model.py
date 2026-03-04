@@ -669,7 +669,7 @@ class MoleculeDataset(Dataset):
 
 # ======================== Collate Function ========================
 
-def collate_fn(batch_list: List[Dict], vocab: MolScannerVocab, max_atoms_limit: int = 100) -> Optional[Dict]:
+def collate_fn(batch_list: List[Dict], vocab: MolScannerVocab, max_atoms_limit: int = 100, max_seq_len: int = 600) -> Optional[Dict]:
     """
     Collate function for chartok_coords format.
     Sequences are pre-tokenized in the dataset; this function pads and batches them.
@@ -678,7 +678,7 @@ def collate_fn(batch_list: List[Dict], vocab: MolScannerVocab, max_atoms_limit: 
     batch_list = [item for item in batch_list if item is not None]
     if len(batch_list) == 0: return None
     
-    # ===== Filter out failed samples and molecules with too many atoms =====
+    # ===== Filter out failed samples and molecules with too many atoms / too long sequences =====
     filtered_batch = []
     for item in batch_list:
         # 1. Skip samples that failed rendering / tokenization
@@ -686,8 +686,12 @@ def collate_fn(batch_list: List[Dict], vocab: MolScannerVocab, max_atoms_limit: 
             continue
         # 2. Skip molecules exceeding the atom-count limit
         n_atoms = len(item['atom_indices'])
-        if n_atoms > 0 and n_atoms <= max_atoms_limit:
-            filtered_batch.append(item)
+        if n_atoms <= 0 or n_atoms > max_atoms_limit:
+            continue
+        # 3. Skip molecules with excessively long token sequences (prevents OOM in attention)
+        if len(item['tok_id_seq']) > max_seq_len:
+            continue
+        filtered_batch.append(item)
     
     if len(filtered_batch) == 0:
         return None
@@ -2717,9 +2721,9 @@ def train(
             max_atoms_val = batch['max_atoms']
             bond_matrices_list = batch['bond_matrices_list']
 
-            # Truncate if needed
+            # Truncate if needed (safety net; collate_fn already filters > 600)
             tgt_tokens, tgt_padding_mask, atom_indices, atom_mask = truncate_sequences(
-                tgt_tokens, tgt_padding_mask, atom_indices, atom_mask, max_seq_len=1000
+                tgt_tokens, tgt_padding_mask, atom_indices, atom_mask, max_seq_len=600
             )
             
             # Teacher forcing
@@ -3433,8 +3437,9 @@ def train_rl_finetune(
             max_atoms_val = batch['max_atoms']
             bond_matrices_list = batch['bond_matrices_list']
 
+            # Truncate if needed (safety net; collate_fn already filters > 600)
             tgt_tokens, tgt_padding_mask, atom_indices, atom_mask = truncate_sequences(
-                tgt_tokens, tgt_padding_mask, atom_indices, atom_mask, max_seq_len=1000
+                tgt_tokens, tgt_padding_mask, atom_indices, atom_mask, max_seq_len=600
             )
 
             tgt_input = tgt_tokens[:, :-1].contiguous()
