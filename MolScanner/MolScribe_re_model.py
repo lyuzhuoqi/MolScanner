@@ -966,20 +966,15 @@ class SequenceDecoder(nn.Module):
         # Positional encoding for sequence
         self.pos_encoder = nn.Embedding(max_seq_len, d_model)
         
-        # Transformer Decoder (Pre-Norm + GELU, matching original MolScribe)
+        # Transformer Decoder
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
-            batch_first=True,
-            norm_first=True,
-            activation='gelu',
+            batch_first=True
         )
-        self.transformer_decoder = nn.TransformerDecoder(
-            decoder_layer, num_layers=num_layers,
-            norm=nn.LayerNorm(d_model),
-        )
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
         
         # Output head: predict next token in vocabulary
         self.output_head = nn.Linear(d_model, vocab_size)
@@ -1030,8 +1025,8 @@ class SequenceDecoder(nn.Module):
         # Flatten image features to sequence: [B, H*W, d_model]
         memory = img_features.flatten(2).permute(0, 2, 1)  # [B, H*W, d_model]
         
-        # Embed target tokens (scale by sqrt(d_model), matching original MolScribe)
-        tgt_emb = self.token_embedding(tgt_tokens) * math.sqrt(self.d_model)  # [B, T, d_model]
+        # Embed target tokens
+        tgt_emb = self.token_embedding(tgt_tokens)  # [B, T, d_model]
         
         # Add positional encoding (optimized: avoid expand by using broadcasting)
         positions = torch.arange(T, device=device)
@@ -1091,9 +1086,9 @@ class SequenceDecoder(nn.Module):
         B = new_token_ids.size(0)
         device = new_token_ids.device
 
-        # Embed the single new token  →  [B, 1, d_model] (scale by sqrt(d_model))
+        # Embed the single new token  →  [B, 1, d_model]
         pos = torch.full((B, 1), step_idx, dtype=torch.long, device=device)
-        h = self.token_embedding(new_token_ids.unsqueeze(1)) * math.sqrt(self.d_model) + self.pos_encoder(pos)
+        h = self.token_embedding(new_token_ids.unsqueeze(1)) + self.pos_encoder(pos)
 
         num_layers = len(self.transformer_decoder.layers)
         if cache is None:
@@ -1106,23 +1101,20 @@ class SequenceDecoder(nn.Module):
         for i, layer in enumerate(self.transformer_decoder.layers):
             lc = cache[i]
 
-            # --- Pre-Norm self-attention (Q=new token, K/V grows) ---
-            h_normed = layer.norm1(h)
+            # --- Self-attention (post-norm, Q=new token, K/V grows) ---
             sa_out, sa_k, sa_v = _mha_with_kv_cache(
-                layer.self_attn, h_normed, h_normed, lc['self_k'], lc['self_v'])
-            h = h + layer.dropout1(sa_out)
+                layer.self_attn, h, h, lc['self_k'], lc['self_v'])
+            h = layer.norm1(h + layer.dropout1(sa_out))
 
-            # --- Pre-Norm cross-attention (K/V=memory, projected once at step 0) ---
-            h_normed = layer.norm2(h)
+            # --- Cross-attention (K/V=memory, projected once at step 0) ---
             cross_new = memory if lc['cross_k'] is None else None
             ca_out, ca_k, ca_v = _mha_with_kv_cache(
-                layer.multihead_attn, h_normed, cross_new, lc['cross_k'], lc['cross_v'])
-            h = h + layer.dropout2(ca_out)
+                layer.multihead_attn, h, cross_new, lc['cross_k'], lc['cross_v'])
+            h = layer.norm2(h + layer.dropout2(ca_out))
 
-            # --- Pre-Norm feed-forward (GELU) ---
-            h_normed = layer.norm3(h)
-            ff = layer.linear2(layer.dropout(layer.activation(layer.linear1(h_normed))))
-            h = h + layer.dropout3(ff)
+            # --- Feed-forward ---
+            ff = layer.linear2(layer.dropout(layer.activation(layer.linear1(h))))
+            h = layer.norm3(h + layer.dropout3(ff))
 
             new_cache.append({
                 'self_k': sa_k, 'self_v': sa_v,
@@ -2966,7 +2958,7 @@ def train(
                 
                 scaler.scale(losses['total_loss']).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
@@ -2990,7 +2982,7 @@ def train(
                 )
                 
                 losses['total_loss'].backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
             
             scheduler.step()
@@ -3587,6 +3579,8 @@ def train_rl_finetune(
         train_iter = iter(train_loader)
 
         for _step in range(steps_in_epoch):
+
+        for _step in range(steps_in_epoch):
             try:
                 batch = next(train_iter)
             except StopIteration:
@@ -3706,7 +3700,7 @@ def train_rl_finetune(
 
                 # Clip & step (accumulated MLE + RL gradients)
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
 
@@ -3771,7 +3765,7 @@ def train_rl_finetune(
                     del img_features, rl_loss
                     rl_baseline_ema = 0.9 * rl_baseline_ema + 0.1 * rl_reward
 
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
                 mle_loss_val = (token_loss_weight * mle_losses['token_loss'].item()
