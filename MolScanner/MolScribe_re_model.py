@@ -1404,6 +1404,8 @@ class AdaptiveResize(A.DualTransform):
         return cv2.resize(img, (self.width, self.height), interpolation=interpolation)
 
     def apply_to_keypoints(self, keypoints, scale_x=1, scale_y=1, **params):
+        if keypoints.size == 0:
+            return keypoints
         result = keypoints.copy()
         result[:, 0] *= scale_x
         result[:, 1] *= scale_y
