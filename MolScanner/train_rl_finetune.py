@@ -53,6 +53,9 @@ if __name__ == '__main__':
                         help='Reward signal for REINFORCE: tanimoto (default), '
                              'edit_distance (Levenshtein similarity), or '
                              'visual (cycle-consistency cosine similarity)')
+    parser.add_argument('--hard_mining', action='store_true',
+                        help='Enable hard-example mining: buffer the highest-loss '
+                             'samples from MLE steps and use them for RL steps')
     args = parser.parse_args()
 
     project_dir = Path(__file__).parent.parent
@@ -127,11 +130,11 @@ if __name__ == '__main__':
         bond_loss_weight=1.0,    # weight for bond CE loss
 
         # ===== RL hyperparameters =====
-        alpha_rl_max=0.1,          # max RL weight after warmup
+        alpha_rl_max=1.0,          # max RL weight after warmup
         alpha_rl_warmup_epochs=0, # linearly anneal alpha from 0 → max over N epochs
         rl_every_n_steps=10,      # compute RL loss every N MLE steps (cost control)
         rl_max_len=500,          # max decode length for RL sampling (match pretraining)
-        rl_temperature=0.5,      # sampling temperature (lower = less noisy)
+        rl_temperature=0.8,      # sampling temperature (lower = less noisy)
         rl_n_samples=16,          # samples per image (set >1 for self-critical baseline)
         rl_subsample=16,         # max images per batch for RL sampling (memory cap)
 
@@ -145,6 +148,9 @@ if __name__ == '__main__':
 
         # ===== Reward mode =====
         reward_mode=args.reward_mode,
+
+        # ===== Hard-example mining =====
+        hard_mining=args.hard_mining,
 
         # resume
         resume_from=resume_path,

@@ -3332,14 +3332,26 @@ def compute_reinforce_tanimoto_loss(
         except Exception:
             gt_canonical.append(s)
 
-    # Extract predicted SMILES for all samples
+    # Extract predicted SMILES for all samples (with bond prediction for postprocess)
     sampled_smiles = []
-    for b in range(total_seqs):
-        result = vocab.sequence_to_smiles(sampled_seqs_list[b])
-        pred_smiles = _result_to_smiles_postprocess(result)
-        if pred_smiles is None:
-            pred_smiles = ''
-        sampled_smiles.append(pred_smiles)
+    with torch.no_grad():
+        for b in range(total_seqs):
+            result = vocab.sequence_to_smiles(sampled_seqs_list[b])
+            # Run bond predictor to get bond_mat for chirality correction
+            try:
+                seq_tensor = torch.tensor([sampled_seqs_list[b]], dtype=torch.long, device=device)
+                atom_idx, atom_cnt = extract_atom_indices_from_tokens(seq_tensor, vocab)
+                a_mask = torch.arange(atom_idx.size(1), device=device) < atom_cnt.unsqueeze(1)
+                feat_b = img_features_expanded[b:b+1]
+                hidden, _ = model.sequence_decoder(feat_b, seq_tensor)
+                e_logits = model.bond_predictor(hidden, atom_idx, a_mask)
+                result['bond_mat'] = _symmetrize_edge_predictions(e_logits[0])
+            except Exception:
+                pass  # bond_mat stays absent; postprocess falls back gracefully
+            pred_smiles = _result_to_smiles_postprocess(result)
+            if pred_smiles is None:
+                pred_smiles = ''
+            sampled_smiles.append(pred_smiles)
 
     # Per-sample validity and exact match (shared across all modes)
     is_valid_list = []
@@ -3540,6 +3552,8 @@ def train_rl_finetune(
     reward_exact_match_weight: float = 0.4,
     # ===== Reward mode =====
     reward_mode: str = 'tanimoto',
+    # ===== Hard-example mining =====
+    hard_mining: bool = False,
     # ===== optimization =====
     num_workers: int = 4,
     use_amp: bool = True,
@@ -3616,7 +3630,7 @@ def train_rl_finetune(
               f'subsample={rl_subsample}, max_len={rl_max_len}')
         print(f'Composite reward weights: validity={reward_validity_weight}, '
               f'similarity={reward_tanimoto_weight}, exact_match={reward_exact_match_weight}')
-        print(f'Reward mode: {reward_mode}')
+        print(f'Reward mode: {reward_mode}  |  Hard-example mining: {hard_mining}')
         print(f'Loss weights: token={token_loss_weight}, bond={bond_loss_weight}')
         print(f'Pretrained model: {pretrained_path}')
 
@@ -3813,6 +3827,17 @@ def train_rl_finetune(
         progress = min(1.0, (epoch - 1) / alpha_rl_warmup_epochs)
         return alpha_rl_max * progress
 
+    # ===== Hard-example mining buffer =====
+    # Between RL steps, we accumulate the hardest samples (highest per-sample
+    # MLE token loss) on CPU.  At the RL step, we use these instead of
+    # random images from the current batch so that RL focuses on what the
+    # model currently struggles with.
+    import heapq  # min-heap for efficient top-K tracking
+
+    # Buffer stores (neg_loss, images_cpu, gt_smiles) — negated loss because
+    # heapq is a min-heap and we want the *highest* losses.
+    _hard_buffer: List[Tuple[float, torch.Tensor, str]] = []
+
     # ===== Training Loop =====
     for epoch in range(start_epoch, num_epochs + 1):
         model.train()
@@ -3908,6 +3933,30 @@ def train_rl_finetune(
                     mle_loss = (token_loss_weight * mle_losses['token_loss']
                                 + bond_loss_weight * mle_losses['bond_loss'])
 
+                # --- Hard-example mining: compute per-sample loss before freeing graph ---
+                if hard_mining and not do_rl:
+                    with torch.no_grad():
+                        B_cur, T_cur, V_cur = token_logits.shape
+                        per_tok = F.cross_entropy(
+                            token_logits.reshape(-1, V_cur),
+                            tgt_target.reshape(-1),
+                            ignore_index=vocab.pad_idx,
+                            reduction='none',
+                        ).reshape(B_cur, T_cur)
+                        valid_mask = (tgt_target != vocab.pad_idx).float()
+                        per_sample_loss = (per_tok * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1)
+
+                    for b_idx in range(B_cur):
+                        loss_val = per_sample_loss[b_idx].item()
+                        seq_b = tgt_tokens[b_idx].tolist()
+                        res_b = vocab.sequence_to_smiles(seq_b)
+                        gt_smi = res_b.get('smiles', '')
+                        item = (loss_val, images[b_idx].detach().cpu(), gt_smi)
+                        if len(_hard_buffer) < rl_subsample:
+                            heapq.heappush(_hard_buffer, item)
+                        elif loss_val > _hard_buffer[0][0]:
+                            heapq.heapreplace(_hard_buffer, item)
+
                 # MLE backward — free the MLE graph before RL
                 scaler.scale(mle_loss).backward()
                 del token_logits, edge_logits, mle_loss
@@ -3917,19 +3966,26 @@ def train_rl_finetune(
                 rl_loss_val = torch.tensor(0.0, device=device)
                 rl_reward = 0.0
                 if do_rl:
-                    # Encode a SUBSAMPLE of images for RL (fp32 for stability)
+                    # --- Select images for RL ---
+                    if hard_mining and _hard_buffer:
+                        hard_sorted = sorted(_hard_buffer, key=lambda x: x[0], reverse=True)
+                        rl_images = torch.stack([h[1] for h in hard_sorted[:rl_subsample_actual]]).to(device)
+                        gt_smiles_batch = [h[2] for h in hard_sorted[:rl_subsample_actual]]
+                        _hard_buffer.clear()
+                    else:
+                        # Fallback: use current batch (when hard_mining off, or buffer empty)
+                        rl_images = images[:rl_subsample_actual]
+                        gt_smiles_batch = []
+                        for b in range(rl_subsample_actual):
+                            seq_b = tgt_tokens[b].tolist()
+                            res = vocab.sequence_to_smiles(seq_b)
+                            gt_smiles_batch.append(res.get('smiles', ''))
+
+                    # Encode images for RL (fp32 for stability)
                     # Gradients flow through both encoder and decoder.
-                    rl_images = images[:rl_subsample_actual]
                     img_features = actual_model.image_encoder(rl_images)
                     img_features = actual_model.pos_enc_2d(img_features)
                     img_features = img_features.float()
-
-                    # Reconstruct GT SMILES for the subsampled images
-                    gt_smiles_batch = []
-                    for b in range(rl_subsample_actual):
-                        seq_b = tgt_tokens[b].tolist()
-                        res = vocab.sequence_to_smiles(seq_b)
-                        gt_smiles_batch.append(res.get('smiles', ''))
 
                     rl_loss, rl_info = compute_reinforce_tanimoto_loss(
                         model=actual_model,
@@ -3988,6 +4044,30 @@ def train_rl_finetune(
                 mle_loss = (token_loss_weight * mle_losses['token_loss']
                             + bond_loss_weight * mle_losses['bond_loss'])
 
+                # --- Hard-example mining: compute per-sample loss before freeing graph ---
+                if hard_mining and not do_rl:
+                    with torch.no_grad():
+                        B_cur, T_cur, V_cur = token_logits.shape
+                        per_tok = F.cross_entropy(
+                            token_logits.reshape(-1, V_cur),
+                            tgt_target.reshape(-1),
+                            ignore_index=vocab.pad_idx,
+                            reduction='none',
+                        ).reshape(B_cur, T_cur)
+                        valid_mask = (tgt_target != vocab.pad_idx).float()
+                        per_sample_loss = (per_tok * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1)
+
+                    for b_idx in range(B_cur):
+                        loss_val = per_sample_loss[b_idx].item()
+                        seq_b = tgt_tokens[b_idx].tolist()
+                        res_b = vocab.sequence_to_smiles(seq_b)
+                        gt_smi = res_b.get('smiles', '')
+                        item = (loss_val, images[b_idx].detach().cpu(), gt_smi)
+                        if len(_hard_buffer) < rl_subsample:
+                            heapq.heappush(_hard_buffer, item)
+                        elif loss_val > _hard_buffer[0][0]:
+                            heapq.heapreplace(_hard_buffer, item)
+
                 # MLE backward first — free graph before RL
                 mle_loss.backward()
                 del token_logits, edge_logits, mle_loss
@@ -3996,16 +4076,24 @@ def train_rl_finetune(
                 rl_loss_val = torch.tensor(0.0, device=device)
                 rl_reward = 0.0
                 if do_rl:
+                    # --- Select images for RL ---
+                    if hard_mining and _hard_buffer:
+                        hard_sorted = sorted(_hard_buffer, key=lambda x: x[0], reverse=True)
+                        rl_images = torch.stack([h[1] for h in hard_sorted[:rl_subsample_actual]]).to(device)
+                        gt_smiles_batch = [h[2] for h in hard_sorted[:rl_subsample_actual]]
+                        _hard_buffer.clear()
+                    else:
+                        # Fallback: use current batch (when hard_mining off, or buffer empty)
+                        rl_images = images[:rl_subsample_actual]
+                        gt_smiles_batch = []
+                        for b in range(rl_subsample_actual):
+                            seq_b = tgt_tokens[b].tolist()
+                            res = vocab.sequence_to_smiles(seq_b)
+                            gt_smiles_batch.append(res.get('smiles', ''))
+
                     # Gradients flow through both encoder and decoder.
-                    rl_images = images[:rl_subsample_actual]
                     img_features = actual_model.image_encoder(rl_images)
                     img_features = actual_model.pos_enc_2d(img_features)
-
-                    gt_smiles_batch = []
-                    for b in range(rl_subsample_actual):
-                        seq_b = tgt_tokens[b].tolist()
-                        res = vocab.sequence_to_smiles(seq_b)
-                        gt_smiles_batch.append(res.get('smiles', ''))
 
                     rl_loss, rl_info = compute_reinforce_tanimoto_loss(
                         model=actual_model,
@@ -4173,5 +4261,446 @@ def train_rl_finetune(
     if world_size > 1:
         dist.barrier()
 
+    cleanup_ddp()
+    return []
+
+
+# ======================== Real-Image RL Finetuning ========================
+
+class RealImageDataset(Dataset):
+    """Dataset that loads real-world molecule images + GT SMILES from CSV.
+
+    CSV columns: image_id, file_path, SMILES
+    Returns (image_tensor, gt_smiles_str) pairs.
+    """
+
+    def __init__(self, csv_path: str, image_dir: str,
+                 transforms, image_size: Tuple[int, int] = (384, 384),
+                 max_samples: Optional[int] = None):
+        label_df = pd.read_csv(csv_path)
+        if max_samples is not None and max_samples < len(label_df):
+            label_df = label_df.sample(n=max_samples, random_state=42).reset_index(drop=True)
+
+        self.items = []
+        for _, row in label_df.iterrows():
+            img_id = str(row['image_id'])
+            img_path = os.path.join(image_dir, f"{img_id}.png")
+            if not os.path.exists(img_path):
+                continue
+            gt_smi = str(row['SMILES'])
+            self.items.append({'img_path': img_path, 'gt_smiles': gt_smi})
+
+        self.transforms = transforms
+        self.image_size = image_size
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx):
+        item = self.items[idx]
+        try:
+            img = Image.open(item['img_path']).convert('RGB')
+            tensor = self.transforms(image=np.array(img))['image']
+        except Exception:
+            tensor = torch.zeros(3, *self.image_size)
+        return tensor, item['gt_smiles']
+
+
+def _real_collate_fn(batch):
+    """Simple collate: stack images, collect SMILES strings."""
+    images = torch.stack([b[0] for b in batch])
+    smiles = [b[1] for b in batch]
+    return images, smiles
+
+
+def train_rl_real_finetune(
+    # ===== Data =====
+    train_csv_paths: List[str],
+    train_image_dirs: List[str],
+    # ===== Validation =====
+    val_benchmark_dir: str = '',
+    val_benchmark_csv: str = '',
+    val_max_samples: Optional[int] = None,
+    # ===== Model =====
+    pretrained_path: str = '',
+    save_path: str = '',
+    # ===== Architecture (must match pretrained) =====
+    image_size: Tuple[int, int] = (384, 384),
+    n_bins: int = 64,
+    backbone: str = 'swin_b',
+    d_model: int = 256,
+    nhead: int = 8,
+    num_decoder_layers: int = 6,
+    dim_feedforward: int = 1024,
+    dropout: float = 0.1,
+    # ===== Training =====
+    num_epochs: int = 10,
+    batch_size: int = 16,
+    encoder_lr: float = 1e-5,
+    decoder_lr: float = 1e-5,
+    weight_decay: float = 1e-6,
+    warmup_ratio: float = 0.02,
+    seed: int = 2026,
+    early_stopping_patience: int = 10,
+    num_workers: int = 4,
+    use_amp: bool = True,
+    force_cpu: bool = False,
+    # ===== RL =====
+    rl_max_len: int = 500,
+    rl_temperature: float = 0.8,
+    rl_n_samples: int = 16,
+    rl_subsample: int = 16,
+    reward_validity_weight: float = 0.1,
+    reward_similarity_weight: float = 0.5,
+    reward_exact_match_weight: float = 0.4,
+    # ===== Resume =====
+    resume_from: Optional[str] = None,
+) -> List[float]:
+    """Pure cycle-consistency RL finetuning on real-world images.
+
+    No MLE loss — only REINFORCE with visual cycle-consistency reward:
+        pred SMILES → render → encode → cosine_sim(features_orig, features_rendered)
+
+    GT SMILES (from CSV) are used for:
+      - exact_match component of composite reward
+      - validation metric computation
+    """
+    # ===== DDP setup =====
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    world_size = int(os.environ.get('WORLD_SIZE', 1))
+    if world_size > 1:
+        setup_ddp(local_rank, world_size)
+
+    if force_cpu:
+        device = torch.device('cpu')
+    elif torch.cuda.is_available():
+        device = torch.device(f'cuda:{local_rank}')
+    else:
+        device = torch.device('cpu')
+
+    if is_main_process():
+        print(f'=== Real-Image RL Finetuning (cycle consistency) ===')
+        print(f'Device: {device}, World size: {world_size}')
+        print(f'Train CSVs: {train_csv_paths}')
+        print(f'rl_temperature={rl_temperature}, rl_n_samples={rl_n_samples}, '
+              f'rl_subsample={rl_subsample}')
+        print(f'reward weights: validity={reward_validity_weight}, '
+              f'similarity={reward_similarity_weight}, '
+              f'exact_match={reward_exact_match_weight}')
+
+    # ===== Vocab + Model =====
+    vocab = MolScannerVocab(n_bins=n_bins)
+
+    model = MolScribeModel(
+        vocab=vocab,
+        backbone=backbone,
+        pretrained=False,
+        d_model=d_model,
+        nhead=nhead,
+        num_decoder_layers=num_decoder_layers,
+        dim_feedforward=dim_feedforward,
+        dropout=dropout,
+        image_size=image_size,
+    ).to(device)
+
+    if is_main_process():
+        print(f'Loading pretrained weights from {pretrained_path} ...')
+    model.load_model(pretrained_path, device=device)
+
+    if world_size > 1:
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True,
+                    gradient_as_bucket_view=True)
+
+    actual_model = model.module if hasattr(model, 'module') else model
+
+    # ===== Dataset =====
+    all_items = []
+    for csv_path, img_dir in zip(train_csv_paths, train_image_dirs):
+        ds = RealImageDataset(csv_path, img_dir, actual_model.inference_transforms,
+                              image_size)
+        all_items.extend(ds.items)
+        if is_main_process():
+            print(f'  Loaded {len(ds)} images from {csv_path}')
+
+    # Build a single dataset from merged items
+    train_dataset = RealImageDataset.__new__(RealImageDataset)
+    train_dataset.items = all_items
+    train_dataset.transforms = actual_model.inference_transforms
+    train_dataset.image_size = image_size
+
+    if is_main_process():
+        print(f'Total training images: {len(train_dataset)}')
+
+    train_sampler = DistributedSampler(
+        train_dataset, num_replicas=world_size, rank=local_rank,
+        shuffle=True, seed=seed,
+    ) if world_size > 1 else None
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=num_workers,
+        pin_memory=device.type == 'cuda',
+        collate_fn=_real_collate_fn,
+        drop_last=True,
+        prefetch_factor=4 if num_workers > 0 else None,
+        persistent_workers=False,
+    )
+
+    # ===== Optimizer =====
+    encoder_param_ids = {id(p) for p in actual_model.image_encoder.parameters()}
+    encoder_params = [p for p in actual_model.parameters() if id(p) in encoder_param_ids]
+    decoder_params = [p for p in actual_model.parameters() if id(p) not in encoder_param_ids]
+
+    optimizer = torch.optim.AdamW([
+        {'params': encoder_params, 'lr': encoder_lr, 'weight_decay': weight_decay},
+        {'params': decoder_params, 'lr': decoder_lr, 'weight_decay': weight_decay},
+    ])
+
+    steps_per_epoch = len(train_loader)
+    total_steps = steps_per_epoch * num_epochs
+    warmup_steps = int(total_steps * warmup_ratio)
+
+    def lr_lambda(current_step: int) -> float:
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return max(0.0, 0.5 * (1.0 + np.cos(np.pi * progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scaler = torch.amp.GradScaler('cuda') if (use_amp and device.type == 'cuda') else None
+
+    # ===== Resume =====
+    start_epoch = 1
+    best_val_acc = 0.0
+    epochs_no_improve = 0
+    rl_baseline_ema = 0.0
+    resume_log_dir = None
+
+    if resume_from is not None and os.path.isfile(resume_from):
+        if is_main_process():
+            print(f'Resuming from {resume_from}')
+        ckpt = torch.load(resume_from, map_location=device, weights_only=False)
+        actual_model.load_state_dict(ckpt['model_state_dict'])
+        if ckpt.get('optimizer_state_dict') is not None:
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        if ckpt.get('scheduler_state_dict') is not None:
+            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        if scaler is not None and ckpt.get('scaler_state_dict') is not None:
+            scaler.load_state_dict(ckpt['scaler_state_dict'])
+        start_epoch = ckpt.get('epoch', 0) + 1
+        best_val_acc = ckpt.get('best_val_acc', 0.0)
+        epochs_no_improve = ckpt.get('epochs_no_improve', 0)
+        rl_baseline_ema = ckpt.get('rl_baseline_ema', 0.0)
+        resume_log_dir = ckpt.get('log_dir', None)
+        if is_main_process():
+            print(f'  Resuming from epoch {start_epoch}, '
+                  f'best_val_acc={best_val_acc:.4f}')
+        del ckpt
+        torch.cuda.empty_cache()
+
+    global_step = (start_epoch - 1) * steps_per_epoch
+
+    # ===== TensorBoard =====
+    writer = None
+    log_dir = None
+    if is_main_process():
+        os.makedirs(save_path, exist_ok=True)
+        if resume_log_dir and os.path.isdir(resume_log_dir):
+            log_dir = resume_log_dir
+        else:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            log_dir = os.path.join(save_path, 'logs', f'real_rl_{timestamp}')
+        writer = SummaryWriter(log_dir=log_dir)
+        print(f'TensorBoard logs: {log_dir}')
+
+    # Broadcast log_dir to all ranks
+    if world_size > 1:
+        if is_main_process():
+            log_dir_bytes = log_dir.encode('utf-8')
+            log_dir_len = torch.tensor([len(log_dir_bytes)], dtype=torch.long, device=device)
+        else:
+            log_dir_len = torch.tensor([0], dtype=torch.long, device=device)
+        dist.broadcast(log_dir_len, src=0)
+        if not is_main_process():
+            log_dir_bytes = bytes(log_dir_len.item())
+        log_dir_tensor = torch.tensor(list(log_dir_bytes if is_main_process()
+                                           else b'\x00' * log_dir_len.item()),
+                                      dtype=torch.uint8, device=device)
+        dist.broadcast(log_dir_tensor, src=0)
+        if not is_main_process():
+            log_dir = bytes(log_dir_tensor.cpu().tolist()).decode('utf-8')
+
+    if is_main_process():
+        print(f'\nSteps/epoch: {steps_per_epoch}, Total steps: {total_steps}, '
+              f'Warmup steps: {warmup_steps}')
+        print(f'Starting from epoch {start_epoch}\n')
+
+    # ===== Training Loop =====
+    for epoch in range(start_epoch, num_epochs + 1):
+        model.train()
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
+        running_reward = 0.0
+        running_loss = 0.0
+        num_batches = 0
+
+        pbar = (tqdm(train_loader, desc=f'Epoch {epoch}', dynamic_ncols=True)
+                if is_main_process() else train_loader)
+
+        for images, gt_smiles_batch in pbar:
+            images = images.to(device, non_blocking=True)
+            rl_subsample_actual = min(rl_subsample, images.size(0))
+
+            optimizer.zero_grad(set_to_none=True)
+
+            # Encode images
+            rl_images = images[:rl_subsample_actual]
+            rl_gt = gt_smiles_batch[:rl_subsample_actual]
+
+            img_features = actual_model.image_encoder(rl_images)
+            img_features = actual_model.pos_enc_2d(img_features)
+            if use_amp:
+                img_features = img_features.float()
+
+            rl_loss, rl_info = compute_reinforce_tanimoto_loss(
+                model=actual_model,
+                img_features=img_features,
+                gt_smiles_list=rl_gt,
+                vocab=vocab,
+                device=device,
+                max_len=rl_max_len,
+                baseline=rl_baseline_ema,
+                temperature=rl_temperature,
+                n_samples=rl_n_samples,
+                reward_validity_weight=reward_validity_weight,
+                reward_tanimoto_weight=reward_similarity_weight,
+                reward_exact_match_weight=reward_exact_match_weight,
+                reward_mode='visual',
+            )
+
+            rl_reward = rl_info['mean_reward']
+
+            if scaler is not None:
+                scaler.scale(rl_loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                rl_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+
+            scheduler.step()
+
+            rl_baseline_ema = 0.9 * rl_baseline_ema + 0.1 * rl_reward
+
+            running_reward += rl_reward
+            running_loss += rl_loss.item()
+            num_batches += 1
+            global_step += 1
+
+            if is_main_process():
+                if hasattr(pbar, 'set_postfix'):
+                    pbar.set_postfix({
+                        'reward': f"{rl_reward:.3f}",
+                        'loss': f"{rl_loss.item():.3f}",
+                        'valid': rl_info.get('valid_smiles_count', 0),
+                        'exact': rl_info.get('exact_matches', 0),
+                    })
+
+                if writer and global_step % 10 == 0:
+                    writer.add_scalar('RL/reward_composite', rl_reward, global_step)
+                    writer.add_scalar('RL/visual_similarity',
+                                      rl_info.get('mean_visual_similarity', 0.0), global_step)
+                    writer.add_scalar('RL/valid_smiles',
+                                      rl_info.get('valid_smiles_count', 0), global_step)
+                    writer.add_scalar('RL/exact_matches',
+                                      rl_info.get('exact_matches', 0), global_step)
+                    writer.add_scalar('RL/baseline_ema', rl_baseline_ema, global_step)
+                    writer.add_scalar('RL/loss', rl_loss.item(), global_step)
+                    writer.add_scalar('RL/render_success',
+                                      rl_info.get('render_success', 0), global_step)
+                    writer.add_scalar('LR/encoder',
+                                      optimizer.param_groups[0]['lr'], global_step)
+
+        # ===== Epoch summary =====
+        avg_reward = running_reward / max(num_batches, 1)
+        avg_loss = running_loss / max(num_batches, 1)
+        if is_main_process():
+            print(f'\nEpoch {epoch}: avg_reward={avg_reward:.4f}, avg_loss={avg_loss:.4f}')
+
+        # ===== Validation =====
+        if val_benchmark_dir and val_benchmark_csv:
+            val_results = validate(
+                model=model,
+                benchmark_dir=val_benchmark_dir,
+                benchmark_csv_path=val_benchmark_csv,
+                device=device,
+                epoch=epoch,
+                writer=writer,
+                global_step=global_step,
+                beam_size=1,
+                max_samples=val_max_samples,
+            )
+
+            val_acc = val_results.get('exact_match_acc', 0.0)
+
+            if is_main_process():
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    epochs_no_improve = 0
+                    torch.save(actual_model.state_dict(),
+                               os.path.join(save_path, 'best.pth'))
+                    print(f'  New best: {best_val_acc:.4f}')
+                else:
+                    epochs_no_improve += 1
+                    print(f'  No improvement ({epochs_no_improve}/{early_stopping_patience})')
+        else:
+            val_acc = 0.0
+
+        # ===== Checkpoint =====
+        if is_main_process():
+            ckpt = {
+                'epoch': epoch,
+                'model_state_dict': actual_model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'scaler_state_dict': scaler.state_dict() if scaler else None,
+                'best_val_acc': best_val_acc,
+                'epochs_no_improve': epochs_no_improve,
+                'rl_baseline_ema': rl_baseline_ema,
+                'log_dir': log_dir,
+            }
+            torch.save(ckpt, os.path.join(save_path, 'checkpoint_resume.pth'))
+            torch.save(actual_model.state_dict(),
+                       os.path.join(save_path, f'epoch_{epoch}.pth'))
+            del ckpt
+
+        # ===== Early stopping =====
+        if epochs_no_improve >= early_stopping_patience and early_stopping_patience > 0:
+            if is_main_process():
+                print(f'Early stopping at epoch {epoch}')
+            break
+
+        if world_size > 1:
+            dist.barrier()
+        model.train()
+
+    # ===== Final save =====
+    if is_main_process():
+        torch.save(actual_model.state_dict(), os.path.join(save_path, 'final.pth'))
+        if writer:
+            writer.close()
+        print('Real-image RL finetuning complete!')
+
+    del model, optimizer, scaler
+    torch.cuda.empty_cache()
+    if world_size > 1:
+        dist.barrier()
     cleanup_ddp()
     return []
