@@ -61,6 +61,13 @@ def _run():
     parser.add_argument('--hard_mining', action='store_true',
                         help='Enable hard-example mining: buffer the highest-loss '
                              'samples from MLE steps and use them for RL steps')
+    parser.add_argument('--rl_method', type=str, default='reinforce',
+                        choices=['reinforce', 'mrt'],
+                        help='RL method: reinforce (REINFORCE with baseline) or '
+                             'mrt (Minimum Risk Training)')
+    parser.add_argument('--mrt_alpha', type=float, default=1.0,
+                        help='Sharpness parameter for MRT softmax weights '
+                             '(higher = sharper; only used when --rl_method=mrt)')
     args = parser.parse_args()
 
     project_dir = Path(__file__).parent.parent
@@ -101,8 +108,8 @@ def _run():
         num_epochs=2 if FAST_TEST else 10,
         # Per-GPU batch size: effective = 32 * 4 GPUs = 128
         batch_size=16 if FAST_TEST else 32,
-        encoder_lr=1e-5,
-        decoder_lr=1e-5,
+        encoder_lr=1e-6,
+        decoder_lr=5e-6,
         weight_decay=1e-6,
         warmup_ratio=0.02,
         seed=2026,
@@ -135,11 +142,11 @@ def _run():
         bond_loss_weight=1.0,    # weight for bond CE loss
 
         # ===== RL hyperparameters =====
-        alpha_rl_max=1.0,          # max RL weight after warmup
+        alpha_rl_max=1,          # max RL weight after warmup (conservative)
         alpha_rl_warmup_epochs=0, # linearly anneal alpha from 0 → max over N epochs
         rl_every_n_steps=10,      # compute RL loss every N MLE steps (cost control)
         rl_max_len=500,          # max decode length for RL sampling (match pretraining)
-        rl_temperature=0.7,      # sampling temperature (lower = less noisy)
+        rl_temperature=0.7,      # sampling temperature (slightly higher for diversity)
         rl_n_samples=16,          # samples per image (set >1 for self-critical baseline)
         rl_subsample=16,         # max images per batch for RL sampling (memory cap)
 
@@ -156,6 +163,10 @@ def _run():
 
         # ===== Hard-example mining =====
         hard_mining=args.hard_mining,
+
+        # ===== RL method =====
+        rl_method=args.rl_method,
+        mrt_alpha=args.mrt_alpha,
 
         # resume
         resume_from=resume_path,
