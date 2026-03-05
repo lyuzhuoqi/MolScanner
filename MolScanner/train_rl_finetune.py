@@ -37,9 +37,14 @@ from MolScribe_re_model import train_rl_finetune
 from pathlib import Path
 import pickle
 import argparse
+from torch.distributed.elastic.multiprocessing.errors import record
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='RL finetuning for MolScribe')
+@record
+def main():
+    _run()
+
+def _run():
+    parser = argparse.ArgumentParser(description='RL finetuning for MolScribe')  # noqa
     parser.add_argument('--resume', action='store_true',
                         help='Resume from rl_finetune/checkpoint_resume.pth')
     parser.add_argument('--resume_from', type=str, default=None,
@@ -134,7 +139,7 @@ if __name__ == '__main__':
         alpha_rl_warmup_epochs=0, # linearly anneal alpha from 0 → max over N epochs
         rl_every_n_steps=10,      # compute RL loss every N MLE steps (cost control)
         rl_max_len=500,          # max decode length for RL sampling (match pretraining)
-        rl_temperature=0.8,      # sampling temperature (lower = less noisy)
+        rl_temperature=0.7,      # sampling temperature (lower = less noisy)
         rl_n_samples=16,          # samples per image (set >1 for self-critical baseline)
         rl_subsample=16,         # max images per batch for RL sampling (memory cap)
 
@@ -155,3 +160,7 @@ if __name__ == '__main__':
         # resume
         resume_from=resume_path,
     )
+
+
+if __name__ == '__main__':
+    main()

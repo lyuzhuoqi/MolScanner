@@ -3353,6 +3353,10 @@ def compute_reinforce_tanimoto_loss(
                 pred_smiles = ''
             sampled_smiles.append(pred_smiles)
 
+    # Free Phase 2 intermediates before Phase 3 teacher-forced pass
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+
     # Per-sample validity and exact match (shared across all modes)
     is_valid_list = []
     is_exact_list = []
@@ -3396,34 +3400,58 @@ def compute_reinforce_tanimoto_loss(
         extra_info['mean_edit_similarity'] = similarity_sum / max(total_seqs, 1)
 
     elif reward_mode == 'visual':
-        # ----- Cycle-consistency visual reward -----
-        # GT feature vectors via global average pooling (detached)
-        gt_feat = img_features_expanded.detach().float().mean(dim=[2, 3])  # [total_seqs, d_model]
+        # ----- Cycle-consistency visual reward (domain-aligned) -----
+        # Both GT and predicted SMILES are rendered with the SAME RDKit
+        # renderer (_fast_render_smiles) to eliminate the Indigo-vs-RDKit
+        # domain gap.  Features are extracted with the encoder (no grad)
+        # and compared via cosine similarity after global average pooling.
 
-        # Render all predicted SMILES to images, preprocess
-        rendered_tensors = []
+        _encode_chunk = 32
+
+        # Render GT SMILES to images with RDKit (same renderer as pred)
+        gt_rendered_tensors = []
+        for smi in gt_canonical:
+            img_np, _ = _fast_render_smiles(smi)
+            gt_rendered_tensors.append(
+                model.inference_transforms(image=img_np)['image']
+            )
+        gt_rendered_batch = torch.stack(gt_rendered_tensors).to(device)
+
+        # Encode GT rendered images in chunks (no grad)
+        gt_feat_chunks = []
+        with torch.no_grad():
+            for i in range(0, total_seqs, _encode_chunk):
+                chunk = gt_rendered_batch[i:i + _encode_chunk]
+                feat = model.image_encoder(chunk)
+                feat = model.pos_enc_2d(feat)
+                feat = feat.float().mean(dim=[2, 3])
+                gt_feat_chunks.append(feat)
+        gt_feat = torch.cat(gt_feat_chunks, dim=0)  # [total_seqs, d_model]
+        del gt_rendered_batch
+
+        # Render all predicted SMILES to images with RDKit
+        pred_rendered_tensors = []
         render_success_count = 0
         for smi in sampled_smiles:
             img_np, ok = _fast_render_smiles(smi)
-            rendered_tensors.append(
+            pred_rendered_tensors.append(
                 model.inference_transforms(image=img_np)['image']
             )
             if ok:
                 render_success_count += 1
+        pred_rendered_batch = torch.stack(pred_rendered_tensors).to(device)
 
-        rendered_batch = torch.stack(rendered_tensors).to(device)  # [total_seqs, 3, H, W]
-
-        # Encode rendered images in chunks (no grad, memory-safe)
+        # Encode predicted rendered images in chunks (no grad)
         pred_feat_chunks = []
-        _encode_chunk = 32
         with torch.no_grad():
             for i in range(0, total_seqs, _encode_chunk):
-                chunk = rendered_batch[i:i + _encode_chunk]
+                chunk = pred_rendered_batch[i:i + _encode_chunk]
                 feat = model.image_encoder(chunk)
                 feat = model.pos_enc_2d(feat)
-                feat = feat.float().mean(dim=[2, 3])  # [chunk_sz, d_model]
+                feat = feat.float().mean(dim=[2, 3])
                 pred_feat_chunks.append(feat)
         pred_feat = torch.cat(pred_feat_chunks, dim=0)  # [total_seqs, d_model]
+        del pred_rendered_batch
 
         # Cosine similarity, clamped to [0, 1]
         cos_sims = F.cosine_similarity(gt_feat, pred_feat, dim=1).clamp(min=0.0)
@@ -3438,7 +3466,7 @@ def compute_reinforce_tanimoto_loss(
 
         extra_info['mean_visual_similarity'] = similarity_sum / max(total_seqs, 1)
         extra_info['render_success'] = render_success_count
-        del rendered_batch, pred_feat, gt_feat  # free memory
+        del pred_feat, gt_feat  # free memory
 
     else:
         raise ValueError(f"Unknown reward_mode='{reward_mode}'. "
@@ -3604,6 +3632,25 @@ def train_rl_finetune(
     # ===== DDP setup =====
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get('WORLD_SIZE', 1))
+
+    # Install crash handler: print full traceback + GPU memory on unhandled exceptions
+    import sys, traceback as _tb
+    _orig_excepthook = sys.excepthook
+    def _crash_handler(exc_type, exc_value, exc_tb):
+        print(f"\n{'='*60}", flush=True)
+        print(f"[Rank {local_rank}] UNHANDLED EXCEPTION:", flush=True)
+        _tb.print_exception(exc_type, exc_value, exc_tb)
+        if torch.cuda.is_available():
+            try:
+                dev = torch.device(f'cuda:{local_rank}')
+                alloc = torch.cuda.memory_allocated(dev) / 1e9
+                reserved = torch.cuda.memory_reserved(dev) / 1e9
+                print(f"[Rank {local_rank}] GPU memory: {alloc:.2f}GB alloc / {reserved:.2f}GB reserved", flush=True)
+            except Exception:
+                pass
+        print(f"{'='*60}\n", flush=True)
+        _orig_excepthook(exc_type, exc_value, exc_tb)
+    sys.excepthook = _crash_handler
 
     if force_cpu or not torch.cuda.is_available():
         device = torch.device('cpu')
@@ -3865,7 +3912,7 @@ def train_rl_finetune(
                 batch = next(train_iter)
             except StopIteration:
                 break
-            except RuntimeError as e:
+            except (RuntimeError, OSError, BrokenPipeError) as e:
                 if is_main_process():
                     warnings.warn(f"DataLoader error at epoch {epoch} step {_step}: {e}")
                 batch = None
@@ -4009,6 +4056,7 @@ def train_rl_finetune(
                     scaled_rl = current_alpha * rl_loss_val
                     scaler.scale(scaled_rl).backward()
                     del img_features, rl_loss, scaled_rl
+                    torch.cuda.empty_cache()
 
                     # Update EMA baseline
                     rl_baseline_ema = 0.9 * rl_baseline_ema + 0.1 * rl_reward
@@ -4114,6 +4162,7 @@ def train_rl_finetune(
                     rl_reward = rl_info['mean_reward']
                     (current_alpha * rl_loss_val).backward()
                     del img_features, rl_loss
+                    torch.cuda.empty_cache()
                     rl_baseline_ema = 0.9 * rl_baseline_ema + 0.1 * rl_reward
 
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
