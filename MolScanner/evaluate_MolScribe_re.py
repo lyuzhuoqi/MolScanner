@@ -14,12 +14,13 @@ if __name__ == '__main__':
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
     device = 'cuda'
 
-    proj_dir = Path.home() / "zqlyu" / "projects" / "MolScanner"
+    # proj_dir = Path.home() / "zqlyu" / "projects" / "MolScanner"
+    proj_dir = Path.home() / "projects" / "Markush"
     data_dir = proj_dir / "data"
 
     vocab = MolScannerVocab(n_bins=64)
     model = MolScribeModel(vocab=vocab, backbone='swin_b', pretrained=True)
-    checkpoint = '20260226_edge_padding_finished'
+    checkpoint = 'best'
     model.load_model(str(proj_dir / "MolScanner" / "models" / "MolScribe_re" / f"{checkpoint}.pth"), device=device)
 
     benchmarks = [
