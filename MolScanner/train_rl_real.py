@@ -33,6 +33,14 @@ if __name__ == '__main__':
                         help='Path to pretrained model weights')
     parser.add_argument('--fast_test', action='store_true',
                         help='Quick smoke-test with tiny data')
+    parser.add_argument('--rl_method', type=str, default='reinforce',
+                        choices=['reinforce', 'mrt'],
+                        help='RL method: reinforce or mrt')
+    parser.add_argument('--mrt_alpha', type=float, default=1.0,
+                        help='MRT alpha (sharpening exponent)')
+    parser.add_argument('--reward_mode', type=str, default='visual',
+                        choices=['visual', 'tanimoto', 'edit_distance'],
+                        help='Reward similarity mode')
     args = parser.parse_args()
 
     project_dir = Path(__file__).parent.parent
@@ -48,7 +56,7 @@ if __name__ == '__main__':
         pretrained_path = args.pretrained
     else:
         pretrained_path = str(molscanner_dir / "models" / "MolScribe_re"
-                              / "20260226_edge_padding_finished.pth")
+                              / "best.pth")
 
     # Training data: staker (50K) + UOB (5.7K) + CLEF (992) + acs (331)
     # Validation: USPTO (5.7K) — held out
@@ -122,6 +130,11 @@ if __name__ == '__main__':
         reward_validity_weight=0.1,
         reward_similarity_weight=0.5,
         reward_exact_match_weight=0.4,
+        reward_mode=args.reward_mode,
+
+        # RL method
+        rl_method=args.rl_method,
+        mrt_alpha=args.mrt_alpha,
 
         # resume
         resume_from=resume_path,

@@ -4815,13 +4815,19 @@ def train_rl_real_finetune(
     reward_validity_weight: float = 0.1,
     reward_similarity_weight: float = 0.5,
     reward_exact_match_weight: float = 0.4,
+    reward_mode: str = 'visual',
+    # ===== RL method =====
+    rl_method: str = 'reinforce',
+    mrt_alpha: float = 1.0,
     # ===== Resume =====
     resume_from: Optional[str] = None,
 ) -> List[float]:
-    """Pure cycle-consistency RL finetuning on real-world images.
+    """Pure RL finetuning on real-world images.
 
-    No MLE loss — only REINFORCE with visual cycle-consistency reward:
-        pred SMILES → render → encode → cosine_sim(features_orig, features_rendered)
+    No MLE loss — only RL with configurable reward mode:
+      - 'visual': cycle-consistency cosine_sim(render(pred), render(gt))
+      - 'tanimoto': Morgan-fingerprint Tanimoto similarity
+      - 'edit_distance': normalized Levenshtein similarity
 
     GT SMILES (from CSV) are used for:
       - exact_match component of composite reward
@@ -4849,6 +4855,8 @@ def train_rl_real_finetune(
         print(f'reward weights: validity={reward_validity_weight}, '
               f'similarity={reward_similarity_weight}, '
               f'exact_match={reward_exact_match_weight}')
+        print(f'rl_method={rl_method}, mrt_alpha={mrt_alpha}, '
+              f'reward_mode={reward_mode}')
 
     # ===== Vocab + Model =====
     vocab = MolScannerVocab(n_bins=n_bins)
@@ -5035,23 +5043,42 @@ def train_rl_real_finetune(
             if use_amp:
                 img_features = img_features.float()
 
-            rl_loss, rl_info = compute_reinforce_tanimoto_loss(
-                model=actual_model,
-                img_features=img_features,
-                gt_smiles_list=rl_gt,
-                vocab=vocab,
-                device=device,
-                max_len=rl_max_len,
-                baseline=rl_baseline_ema,
-                temperature=rl_temperature,
-                n_samples=rl_n_samples,
-                reward_validity_weight=reward_validity_weight,
-                reward_tanimoto_weight=reward_similarity_weight,
-                reward_exact_match_weight=reward_exact_match_weight,
-                reward_mode='visual',
-                frozen_encoder=frozen_encoder,
-                frozen_pos_enc=frozen_pos_enc,
-            )
+            if rl_method == 'mrt':
+                rl_loss, rl_info = compute_mrt_loss(
+                    model=actual_model,
+                    img_features=img_features,
+                    gt_smiles_list=rl_gt,
+                    vocab=vocab,
+                    device=device,
+                    max_len=rl_max_len,
+                    temperature=rl_temperature,
+                    n_samples=rl_n_samples,
+                    mrt_alpha=mrt_alpha,
+                    reward_validity_weight=reward_validity_weight,
+                    reward_tanimoto_weight=reward_similarity_weight,
+                    reward_exact_match_weight=reward_exact_match_weight,
+                    reward_mode=reward_mode,
+                    frozen_encoder=frozen_encoder,
+                    frozen_pos_enc=frozen_pos_enc,
+                )
+            else:
+                rl_loss, rl_info = compute_reinforce_tanimoto_loss(
+                    model=actual_model,
+                    img_features=img_features,
+                    gt_smiles_list=rl_gt,
+                    vocab=vocab,
+                    device=device,
+                    max_len=rl_max_len,
+                    baseline=rl_baseline_ema,
+                    temperature=rl_temperature,
+                    n_samples=rl_n_samples,
+                    reward_validity_weight=reward_validity_weight,
+                    reward_tanimoto_weight=reward_similarity_weight,
+                    reward_exact_match_weight=reward_exact_match_weight,
+                    reward_mode=reward_mode,
+                    frozen_encoder=frozen_encoder,
+                    frozen_pos_enc=frozen_pos_enc,
+                )
 
             rl_reward = rl_info['mean_reward']
 
@@ -5084,7 +5111,7 @@ def train_rl_real_finetune(
                         'exact': rl_info.get('exact_matches', 0),
                     })
 
-                if writer and global_step % 10 == 0:
+                if writer:
                     writer.add_scalar('RL/reward_composite', rl_reward, global_step)
                     writer.add_scalar('RL/visual_similarity',
                                       rl_info.get('mean_visual_similarity', 0.0), global_step)
