@@ -58,19 +58,13 @@ if __name__ == '__main__':
         pretrained_path = str(molscanner_dir / "models" / "MolScribe_re"
                               / "best.pth")
 
-    # Training data: staker (50K) + UOB (5.7K) + CLEF (992) + acs (331)
+    # Training data: MolParser-7M sft_real (~91K)
     # Validation: USPTO (5.7K) — held out
     train_csv_paths = [
-        str(real_dir / "staker.csv"),
-        str(real_dir / "UOB.csv"),
-        str(real_dir / "CLEF.csv"),
-        str(real_dir / "acs.csv"),
+        str(data_dir / "molparser_sft_real" / "sft_real.csv"),
     ]
     train_image_dirs = [
-        str(real_dir / "staker"),
-        str(real_dir / "UOB"),
-        str(real_dir / "CLEF"),
-        str(real_dir / "acs"),
+        str(data_dir / "molparser_sft_real" / "images"),
     ]
 
     # Resume checkpoint
