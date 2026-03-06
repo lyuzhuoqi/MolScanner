@@ -4160,6 +4160,56 @@ def train_rl_finetune(
             log_dir = os.path.join(save_path, 'logs', f'rl_{timestamp}')
             print(f'TensorBoard logs: {log_dir}')
         writer = SummaryWriter(log_dir=log_dir)
+
+        # ===== Save hyperparameters for this run =====
+        hparams = {
+            'batch_size': batch_size,
+            'effective_batch_size': batch_size * world_size,
+            'encoder_lr': encoder_lr,
+            'decoder_lr': decoder_lr,
+            'weight_decay': weight_decay,
+            'warmup_ratio': warmup_ratio,
+            'num_epochs': num_epochs,
+            'smiles_num': smiles_num,
+            'max_atoms': max_atoms,
+            'mol_augment': mol_augment,
+            'image_size': str(image_size),
+            'n_bins': n_bins,
+            'backbone': backbone,
+            'd_model': d_model,
+            'nhead': nhead,
+            'num_decoder_layers': num_decoder_layers,
+            'dim_feedforward': dim_feedforward,
+            'dropout': dropout,
+            'token_loss_weight': token_loss_weight,
+            'bond_loss_weight': bond_loss_weight,
+            'rl_method': rl_method,
+            'alpha_rl_max': alpha_rl_max,
+            'alpha_rl_warmup_epochs': alpha_rl_warmup_epochs,
+            'rl_every_n_steps': rl_every_n_steps,
+            'rl_max_len': rl_max_len,
+            'rl_temperature': rl_temperature,
+            'rl_n_samples': rl_n_samples,
+            'rl_subsample': rl_subsample,
+            'reward_mode': reward_mode,
+            'reward_validity_weight': reward_validity_weight,
+            'reward_tanimoto_weight': reward_tanimoto_weight,
+            'reward_exact_match_weight': reward_exact_match_weight,
+            'hard_mining': hard_mining,
+            'mrt_alpha': mrt_alpha if rl_method == 'mrt' else None,
+            'seed': seed,
+            'pretrained_path': pretrained_path,
+        }
+        # 1) Save as YAML file in the log directory
+        import json
+        hparams_path = os.path.join(log_dir, 'hparams.json')
+        with open(hparams_path, 'w') as f:
+            json.dump(hparams, f, indent=2)
+        # 2) Log as TensorBoard text for easy viewing
+        hparams_md = '| Param | Value |\n|---|---|\n'
+        for k, v in hparams.items():
+            hparams_md += f'| {k} | {v} |\n'
+        writer.add_text('Hyperparameters', hparams_md, global_step=0)
     else:
         log_dir = None
 
@@ -4193,9 +4243,11 @@ def train_rl_finetune(
     # model currently struggles with.
     import heapq  # min-heap for efficient top-K tracking
 
-    # Buffer stores (neg_loss, images_cpu, gt_smiles) — negated loss because
-    # heapq is a min-heap and we want the *highest* losses.
-    _hard_buffer: List[Tuple[float, torch.Tensor, str]] = []
+    # Buffer stores (loss, counter, images_cpu, gt_smiles).
+    # heapq is a min-heap; the counter acts as a tiebreaker so that
+    # tensor elements are never compared (which would raise an error).
+    _hard_buffer: List[Tuple[float, int, torch.Tensor, str]] = []
+    _hard_counter = 0
 
     # ===== Training Loop =====
     for epoch in range(start_epoch, num_epochs + 1):
@@ -4310,7 +4362,8 @@ def train_rl_finetune(
                         seq_b = tgt_tokens[b_idx].tolist()
                         res_b = vocab.sequence_to_smiles(seq_b)
                         gt_smi = res_b.get('smiles', '')
-                        item = (loss_val, images[b_idx].detach().cpu(), gt_smi)
+                        item = (loss_val, _hard_counter, images[b_idx].detach().cpu(), gt_smi)
+                        _hard_counter += 1
                         if len(_hard_buffer) < rl_subsample:
                             heapq.heappush(_hard_buffer, item)
                         elif loss_val > _hard_buffer[0][0]:
@@ -4328,8 +4381,8 @@ def train_rl_finetune(
                     # --- Select images for RL ---
                     if hard_mining and _hard_buffer:
                         hard_sorted = sorted(_hard_buffer, key=lambda x: x[0], reverse=True)
-                        rl_images = torch.stack([h[1] for h in hard_sorted[:rl_subsample_actual]]).to(device)
-                        gt_smiles_batch = [h[2] for h in hard_sorted[:rl_subsample_actual]]
+                        rl_images = torch.stack([h[2] for h in hard_sorted[:rl_subsample_actual]]).to(device)
+                        gt_smiles_batch = [h[3] for h in hard_sorted[:rl_subsample_actual]]
                         _hard_buffer.clear()
                     else:
                         # Fallback: use current batch (when hard_mining off, or buffer empty)
@@ -4446,7 +4499,8 @@ def train_rl_finetune(
                         seq_b = tgt_tokens[b_idx].tolist()
                         res_b = vocab.sequence_to_smiles(seq_b)
                         gt_smi = res_b.get('smiles', '')
-                        item = (loss_val, images[b_idx].detach().cpu(), gt_smi)
+                        item = (loss_val, _hard_counter, images[b_idx].detach().cpu(), gt_smi)
+                        _hard_counter += 1
                         if len(_hard_buffer) < rl_subsample:
                             heapq.heappush(_hard_buffer, item)
                         elif loss_val > _hard_buffer[0][0]:
@@ -4463,8 +4517,8 @@ def train_rl_finetune(
                     # --- Select images for RL ---
                     if hard_mining and _hard_buffer:
                         hard_sorted = sorted(_hard_buffer, key=lambda x: x[0], reverse=True)
-                        rl_images = torch.stack([h[1] for h in hard_sorted[:rl_subsample_actual]]).to(device)
-                        gt_smiles_batch = [h[2] for h in hard_sorted[:rl_subsample_actual]]
+                        rl_images = torch.stack([h[2] for h in hard_sorted[:rl_subsample_actual]]).to(device)
+                        gt_smiles_batch = [h[3] for h in hard_sorted[:rl_subsample_actual]]
                         _hard_buffer.clear()
                     else:
                         # Fallback: use current batch (when hard_mining off, or buffer empty)

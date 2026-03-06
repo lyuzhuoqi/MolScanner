@@ -106,8 +106,8 @@ def _run():
         save_path=str(save_dir),
         pretrained_path=pretrained_path,
         num_epochs=2 if FAST_TEST else 10,
-        # Per-GPU batch size: effective = 32 * 4 GPUs = 128
-        batch_size=16 if FAST_TEST else 32,
+        # Per-GPU batch size: effective = 64 * 4 GPUs = 256
+        batch_size=16 if FAST_TEST else 64,
         encoder_lr=1e-6,
         decoder_lr=5e-6,
         weight_decay=1e-6,
@@ -142,11 +142,11 @@ def _run():
         bond_loss_weight=1.0,    # weight for bond CE loss
 
         # ===== RL hyperparameters =====
-        alpha_rl_max=1,          # max RL weight after warmup (conservative)
-        alpha_rl_warmup_epochs=0, # linearly anneal alpha from 0 → max over N epochs
+        alpha_rl_max=0.5,        # max RL weight after warmup (conservative to avoid collapse)
+        alpha_rl_warmup_epochs=0, # linearly anneal alpha from 0 → max over 1 epoch
         rl_every_n_steps=10,      # compute RL loss every N MLE steps (cost control)
         rl_max_len=500,          # max decode length for RL sampling (match pretraining)
-        rl_temperature=0.7,      # sampling temperature (slightly higher for diversity)
+        rl_temperature=0.8,      # sampling temperature (slightly higher for diversity)
         rl_n_samples=16,          # samples per image (set >1 for self-critical baseline)
         rl_subsample=16,         # max images per batch for RL sampling (memory cap)
 
