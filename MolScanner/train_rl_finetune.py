@@ -3,13 +3,22 @@ RL Finetuning Launcher for MolScribe_re
 =======================================
 
 Finetunes a pretrained MolScribe model with a combined loss:
-    L_total = w_t·L_token + w_b·L_bond + α(t) · L_REINFORCE_composite
+    L_total = w_t·L_token + w_b·L_bond + α(t) · L_REINFORCE
 
-    Composite reward: R = w_v·𝟙[valid] + w_t·Tanimoto + w_e·𝟙[exact match]
+    Reward mode (selectable via --reward_mode):
+      - 'tanimoto':      R = w_v·𝟙[valid] + w_sim·Tanimoto + w_e·𝟙[exact]
+      - 'edit_distance':  R = w_v·𝟙[valid] + w_sim·LevenshteinSim + w_e·𝟙[exact]
+      - 'visual':         R = w_v·𝟙[valid] + w_sim·CosineSim(enc(render(pred)), enc(gt)) + w_e·𝟙[exact]
 
 Usage:
-    # Multi-GPU (4x L40)
+    # Multi-GPU (4x L40) with tanimoto reward (default)
     CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 train_rl_finetune.py
+
+    # Visual cycle-consistency reward
+    CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 train_rl_finetune.py --reward_mode visual
+
+    # Edit-distance reward
+    CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 train_rl_finetune.py --reward_mode edit_distance
 
     # Resume
     CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 train_rl_finetune.py --resume
@@ -28,9 +37,14 @@ from MolScribe_re_model import train_rl_finetune
 from pathlib import Path
 import pickle
 import argparse
+from torch.distributed.elastic.multiprocessing.errors import record
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='RL finetuning for MolScribe')
+@record
+def main():
+    _run()
+
+def _run():
+    parser = argparse.ArgumentParser(description='RL finetuning for MolScribe')  # noqa
     parser.add_argument('--resume', action='store_true',
                         help='Resume from rl_finetune/checkpoint_resume.pth')
     parser.add_argument('--resume_from', type=str, default=None,
@@ -39,6 +53,21 @@ if __name__ == '__main__':
                         help='Path to pretrained model weights (.pth)')
     parser.add_argument('--fast_test', action='store_true',
                         help='Quick smoke-test with tiny data')
+    parser.add_argument('--reward_mode', type=str, default='tanimoto',
+                        choices=['tanimoto', 'edit_distance', 'visual'],
+                        help='Reward signal for REINFORCE: tanimoto (default), '
+                             'edit_distance (Levenshtein similarity), or '
+                             'visual (cycle-consistency cosine similarity)')
+    parser.add_argument('--hard_mining', action='store_true',
+                        help='Enable hard-example mining: buffer the highest-loss '
+                             'samples from MLE steps and use them for RL steps')
+    parser.add_argument('--rl_method', type=str, default='reinforce',
+                        choices=['reinforce', 'mrt'],
+                        help='RL method: reinforce (REINFORCE with baseline) or '
+                             'mrt (Minimum Risk Training)')
+    parser.add_argument('--mrt_alpha', type=float, default=1.0,
+                        help='Sharpness parameter for MRT softmax weights '
+                             '(higher = sharper; only used when --rl_method=mrt)')
     args = parser.parse_args()
 
     project_dir = Path(__file__).parent.parent
@@ -79,8 +108,8 @@ if __name__ == '__main__':
         num_epochs=2 if FAST_TEST else 10,
         # Per-GPU batch size: effective = 32 * 4 GPUs = 128
         batch_size=16 if FAST_TEST else 32,
-        encoder_lr=1e-5,
-        decoder_lr=1e-5,
+        encoder_lr=1e-6,
+        decoder_lr=5e-6,
         weight_decay=1e-6,
         warmup_ratio=0.02,
         seed=2026,
@@ -113,20 +142,36 @@ if __name__ == '__main__':
         bond_loss_weight=1.0,    # weight for bond CE loss
 
         # ===== RL hyperparameters =====
-        alpha_rl_max=0.1,          # max RL weight after warmup
-        alpha_rl_warmup_epochs=3, # linearly anneal alpha from 0 → max over N epochs
+        alpha_rl_max=1,          # max RL weight after warmup (conservative)
+        alpha_rl_warmup_epochs=0, # linearly anneal alpha from 0 → max over N epochs
         rl_every_n_steps=10,      # compute RL loss every N MLE steps (cost control)
         rl_max_len=500,          # max decode length for RL sampling (match pretraining)
-        rl_temperature=0.7,      # sampling temperature (lower = less noisy)
-        rl_n_samples=8,          # samples per image (set >1 for self-critical baseline)
-        rl_subsample=32,         # max images per batch for RL sampling (memory cap)
+        rl_temperature=0.7,      # sampling temperature (slightly higher for diversity)
+        rl_n_samples=16,          # samples per image (set >1 for self-critical baseline)
+        rl_subsample=16,         # max images per batch for RL sampling (memory cap)
 
         # ===== Composite reward weights =====
-        # R = w_v·𝟙[valid] + w_t·Tanimoto + w_e·𝟙[exact match]
+        # R = w_v·𝟙[valid] + w_sim·Similarity + w_e·𝟙[exact match]
+        # (w_sim multiplies Tanimoto, edit-distance, or visual cosine-sim
+        #  depending on reward_mode)
         reward_validity_weight=0.1,    # coarse signal for invalid SMILES
-        reward_tanimoto_weight=0.5,    # smooth continuous similarity
+        reward_tanimoto_weight=0.5,    # weight for main similarity signal
         reward_exact_match_weight=0.4, # sharp bonus for perfect predictions
+
+        # ===== Reward mode =====
+        reward_mode=args.reward_mode,
+
+        # ===== Hard-example mining =====
+        hard_mining=args.hard_mining,
+
+        # ===== RL method =====
+        rl_method=args.rl_method,
+        mrt_alpha=args.mrt_alpha,
 
         # resume
         resume_from=resume_path,
     )
+
+
+if __name__ == '__main__':
+    main()
