@@ -107,8 +107,8 @@ if __name__ == '__main__':
         dropout=0.1,
 
         # training
-        num_epochs=2 if FAST_TEST else 20,
-        batch_size=8 if FAST_TEST else 16,
+        num_epochs=2 if FAST_TEST else 10,
+        batch_size=8 if FAST_TEST else 32,
         encoder_lr=1e-5,
         decoder_lr=1e-5,
         weight_decay=1e-6,

@@ -3202,9 +3202,8 @@ def _levenshtein_similarity(s1: str, s2: str) -> float:
 def _fast_render_smiles(smiles: str) -> Tuple[np.ndarray, bool]:
     """Render SMILES to a numpy image using RDKit Draw (~5 ms/call).
 
-    Much faster than Indigo-based generate_image_from_smiles, suitable for
-    batch rendering during RL training.  Returns (H×W×3 uint8, success).
-    Colour order is irrelevant because inference_transforms applies ToGray.
+    Fast and lightweight, suitable for batch rendering during RL training.
+    Returns (H×W×3 uint8, success_bool).
     """
     try:
         mol = Chem.MolFromSmiles(smiles)
@@ -3220,9 +3219,9 @@ def _fast_render_smiles(smiles: str) -> Tuple[np.ndarray, bool]:
         return _blank_image(), False
 
 
-# ======================== REINFORCE Composite Reward Loss ========================
+# ======================== REINFORCE Loss ========================
 
-def compute_reinforce_tanimoto_loss(
+def compute_reinforce_loss(
     model: MolScribeModel,
     img_features: torch.Tensor,
     gt_smiles_list: List[str],
@@ -3232,78 +3231,57 @@ def compute_reinforce_tanimoto_loss(
     baseline: float = 0.0,
     temperature: float = 1.0,
     n_samples: int = 1,
-    # ===== Composite reward weights =====
     reward_validity_weight: float = 0.1,
-    reward_tanimoto_weight: float = 0.5,
+    reward_similarity_weight: float = 0.5,
     reward_exact_match_weight: float = 0.4,
-    # ===== Reward mode =====
     reward_mode: str = 'tanimoto',
-    # ===== Frozen reference encoder (visual mode) =====
     frozen_encoder: Optional[nn.Module] = None,
     frozen_pos_enc: Optional[nn.Module] = None,
 ) -> Tuple[torch.Tensor, Dict]:
-    """REINFORCE-based composite reward loss for MolScribe.
+    """REINFORCE loss with composite reward for molecule image recognition.
 
-    Treats the autoregressive decoder as a stochastic policy π_θ that
-    emits tokens.  The reward is a weighted combination of three signals:
+    Treats the autoregressive decoder as a stochastic policy π_θ.
+    The reward is a weighted sum of three signals:
 
-        R = w_v · 𝟙[valid SMILES] + w_sim · Similarity(pred, gt) + w_e · 𝟙[exact match]
+        R = w_v · 𝟙[valid] + w_sim · Similarity(pred, gt) + w_e · 𝟙[exact]
 
     where Similarity depends on ``reward_mode``:
 
-      - ``'tanimoto'``: Morgan-fingerprint Tanimoto similarity (original).
+      - ``'tanimoto'``: Morgan-fingerprint Tanimoto similarity.
       - ``'edit_distance'``: Normalized Levenshtein similarity on canonical
-        SMILES.  Provides finer-grained, token-level gradient signal.
-      - ``'visual'``: Cycle-consistency visual reward.  Both predicted and
-        GT SMILES are rendered with RDKit, encoded by a frozen reference
-        encoder (if provided) or the model's own encoder, and compared
-        via cosine similarity after global average pooling.
+        SMILES (finer-grained, token-level gradient signal).
+      - ``'visual'``: Cycle-consistency visual reward — both pred and GT
+        SMILES are rendered with RDKit, encoded by a frozen reference
+        encoder, and compared via cosine similarity.
 
-    ``reward_tanimoto_weight`` controls the weight of the main similarity
-    signal regardless of mode (kept for backward compatibility).
+    Loss:  L = −(R − baseline) · Σ_t log P(a_t | a_{<t}, x; θ)
 
-    L_RL = −(R − baseline) · Σ_t log P(a_t | a_{1:t−1}, image; θ)
+    Memory-efficient: sampling uses ``torch.no_grad()``, then a single
+    teacher-forced forward pass recomputes log P for backprop.
 
-    Memory-efficient implementation:
-      - Autoregressive sampling is done under ``torch.no_grad()`` (no graph
-        stored for the sequential decoding loop).
-      - After sampling, a SINGLE teacher-forced forward pass through the
-        decoder with the sampled sequence recomputes ``log P`` for all
-        timesteps in one call.  This produces a compact gradient graph
-        (one decoder call instead of T calls).
-
-    When ``n_samples > 1``, each image is decoded ``n_samples`` times and
-    the self-critical baseline (mean reward across samples) is used for
-    lower variance.
+    When ``n_samples > 1``, self-critical baseline (mean reward across
+    samples) is used for variance reduction.
 
     Args:
-        model: MolScribeModel (must NOT be DDP-wrapped — pass ``actual_model``).
+        model: MolScribeModel (unwrapped, not DDP).
         img_features: [B, d_model, H, W] encoded image features.
-            When gradients through the encoder are desired, pass features
-            **with** the computation graph attached; the REINFORCE loss will
-            back-propagate through both decoder and encoder.
         gt_smiles_list: Ground truth SMILES, length B.
         vocab: MolScannerVocab.
         device: Compute device.
         max_len: Max autoregressive decode length.
         baseline: Constant baseline (overridden by self-critical when n_samples>1).
         temperature: Softmax temperature for exploration.
-        n_samples: Number of samples per image for variance reduction.
-        reward_validity_weight: Weight for the valid-SMILES indicator reward.
-        reward_tanimoto_weight: Weight for the main similarity signal
-            (Tanimoto / edit-distance / visual cosine-sim depending on mode).
-        reward_exact_match_weight: Weight for the exact-match indicator reward.
-        reward_mode: One of ``'tanimoto'``, ``'edit_distance'``, ``'visual'``.
-        frozen_encoder: Optional frozen copy of image_encoder for stable
-            visual reward computation. If None, uses model.image_encoder.
-        frozen_pos_enc: Optional frozen copy of pos_enc_2d. If None, uses
-            model.pos_enc_2d.
+        n_samples: Samples per image (>1 enables self-critical baseline).
+        reward_validity_weight: Weight for valid-SMILES indicator.
+        reward_similarity_weight: Weight for the main similarity signal.
+        reward_exact_match_weight: Weight for exact-match indicator.
+        reward_mode: ``'tanimoto'``, ``'edit_distance'``, or ``'visual'``.
+        frozen_encoder: Frozen image_encoder copy for stable visual reward.
+        frozen_pos_enc: Frozen pos_enc_2d copy for stable visual reward.
 
     Returns:
-        loss: Scalar tensor with gradient graph (through decoder params).
-        info: Dict with 'mean_reward', 'mean_log_prob', 'sampled_smiles',
-              'n_valid', 'mean_similarity', 'exact_matches',
-              'valid_smiles_count', plus mode-specific keys.
+        loss: Scalar REINFORCE loss with gradient graph.
+        info: Dict with diagnostic metrics (mean_reward, mean_similarity, etc.).
     """
     B = img_features.size(0)
     total_seqs = B * n_samples
@@ -3385,33 +3363,29 @@ def compute_reinforce_tanimoto_loss(
     extra_info: Dict = {}
 
     if reward_mode == 'tanimoto':
-        # ----- Tanimoto (Morgan fingerprint) similarity -----
         for b in range(total_seqs):
             tanimoto = compute_tanimoto_similarity(sampled_smiles[b], gt_canonical[b])
             r = (reward_validity_weight * float(is_valid_list[b])
-                 + reward_tanimoto_weight * tanimoto
+                 + reward_similarity_weight * tanimoto
                  + reward_exact_match_weight * float(is_exact_list[b]))
             rewards[b] = r
             similarity_sum += tanimoto
         extra_info['mean_tanimoto'] = similarity_sum / max(total_seqs, 1)
 
     elif reward_mode == 'edit_distance':
-        # ----- Normalised Levenshtein similarity on canonical SMILES -----
         for b in range(total_seqs):
             edit_sim = _levenshtein_similarity(sampled_smiles[b], gt_canonical[b])
             r = (reward_validity_weight * float(is_valid_list[b])
-                 + reward_tanimoto_weight * edit_sim
+                 + reward_similarity_weight * edit_sim
                  + reward_exact_match_weight * float(is_exact_list[b]))
             rewards[b] = r
             similarity_sum += edit_sim
         extra_info['mean_edit_similarity'] = similarity_sum / max(total_seqs, 1)
 
     elif reward_mode == 'visual':
-        # ----- Cycle-consistency visual reward (domain-aligned) -----
         # Both GT and predicted SMILES are rendered with the SAME RDKit
-        # renderer (_fast_render_smiles) to eliminate the Indigo-vs-RDKit
-        # domain gap.  A frozen reference encoder (if provided) gives
-        # stable reward signals that don't drift as the model trains.
+        # renderer to eliminate domain gap. A frozen reference encoder
+        # gives stable reward signals that don't drift during training.
 
         _encode_chunk = 32
         _ref_encoder = frozen_encoder if frozen_encoder is not None else model.image_encoder
@@ -3468,20 +3442,19 @@ def compute_reinforce_tanimoto_loss(
         for b in range(total_seqs):
             visual_sim = cos_sims[b].item()
             r = (reward_validity_weight * float(is_valid_list[b])
-                 + reward_tanimoto_weight * visual_sim
+                 + reward_similarity_weight * visual_sim
                  + reward_exact_match_weight * float(is_exact_list[b]))
             rewards[b] = r
             similarity_sum += visual_sim
 
         extra_info['mean_visual_similarity'] = similarity_sum / max(total_seqs, 1)
         extra_info['render_success'] = render_success_count
-        del pred_feat, gt_feat  # free memory
+        del pred_feat, gt_feat
 
     else:
         raise ValueError(f"Unknown reward_mode='{reward_mode}'. "
                          f"Choose from 'tanimoto', 'edit_distance', 'visual'.")
 
-    # Legacy: number of samples with positive similarity
     n_valid = sum(1 for b in range(total_seqs)
                   if rewards[b].item() > reward_validity_weight + 1e-6)
 
@@ -3550,65 +3523,46 @@ def compute_mrt_loss(
     temperature: float = 1.0,
     n_samples: int = 8,
     mrt_alpha: float = 1.0,
-    # ===== Composite reward weights =====
     reward_validity_weight: float = 0.1,
-    reward_tanimoto_weight: float = 0.5,
+    reward_similarity_weight: float = 0.5,
     reward_exact_match_weight: float = 0.4,
-    # ===== Reward mode =====
     reward_mode: str = 'tanimoto',
-    # ===== Frozen reference encoder (visual mode) =====
     frozen_encoder: Optional[nn.Module] = None,
     frozen_pos_enc: Optional[nn.Module] = None,
 ) -> Tuple[torch.Tensor, Dict]:
-    """Minimum Risk Training (MRT) loss for MolScribe.
+    """Minimum Risk Training (MRT) loss for molecule image recognition.
 
-    Instead of REINFORCE's high-variance score-function estimator, MRT
-    directly minimizes the expected cost (1 − reward) under the model's
-    sampling distribution, approximated by N samples per image.
+    Minimizes expected cost (1 − reward) under the model's sampling
+    distribution, approximated by N candidates per image.
 
-    For each image, N candidate sequences are sampled.  A single
-    teacher-forced forward pass recomputes ``log p(y_i | x)`` for each
-    candidate.  The per-image loss is a softmax-weighted average of costs:
-
+    Per-image loss:
         L_MRT = Σ_i  w_i · (1 − R_i)
-
-    where the weights are the **renormalized model probabilities** among
-    the N candidates:
-
         w_i = softmax(α · log p(y_i | x))_i
 
-    Key differences from REINFORCE:
-      - Gradients flow through the softmax weights (pathwise), giving
-        **per-token** gradient signal — not just a scalar advantage
-        multiplied across all timesteps.
-      - Natural variance reduction: softmax normalization keeps gradients
-        bounded regardless of absolute reward magnitude.
+    Key advantages over REINFORCE:
+      - Pathwise gradients through softmax weights → per-token signal.
+      - Bounded gradients from softmax normalization → lower variance.
       - No baseline needed.
-
-    The reward can be any of the modes supported by REINFORCE (tanimoto,
-    edit_distance, visual).
 
     Args:
         model: MolScribeModel (unwrapped, not DDP).
-        img_features: [B, d_model, H, W] encoded image features WITH
-            computation graph for backprop through encoder.
+        img_features: [B, d_model, H, W] with computation graph.
         gt_smiles_list: Ground truth SMILES, length B.
         vocab: MolScannerVocab.
         device: Compute device.
         max_len: Max autoregressive decode length.
-        temperature: Sampling temperature for candidate generation.
-        n_samples: Number of candidates per image (≥2).
-        mrt_alpha: Sharpness of the softmax over candidate log-probs.
-            Higher α → more weight on the model's top candidate.
+        temperature: Sampling temperature for candidates.
+        n_samples: Candidates per image (≥ 2).
+        mrt_alpha: Softmax sharpness over candidate log-probs.
         reward_validity_weight: Weight for valid-SMILES indicator.
-        reward_tanimoto_weight: Weight for main similarity signal.
+        reward_similarity_weight: Weight for main similarity signal.
         reward_exact_match_weight: Weight for exact-match indicator.
-        reward_mode: 'tanimoto', 'edit_distance', or 'visual'.
-        frozen_encoder: Optional frozen encoder for visual reward.
-        frozen_pos_enc: Optional frozen pos_enc_2d for visual reward.
+        reward_mode: ``'tanimoto'``, ``'edit_distance'``, or ``'visual'``.
+        frozen_encoder: Frozen encoder for stable visual reward.
+        frozen_pos_enc: Frozen pos_enc_2d for stable visual reward.
 
     Returns:
-        loss: Scalar tensor with gradient graph.
+        loss: Scalar MRT loss with gradient graph.
         info: Dict with diagnostic metrics.
     """
     B = img_features.size(0)
@@ -3685,7 +3639,7 @@ def compute_mrt_loss(
         for b in range(total_seqs):
             tanimoto = compute_tanimoto_similarity(sampled_smiles[b], gt_canonical[b])
             r = (reward_validity_weight * float(is_valid_list[b])
-                 + reward_tanimoto_weight * tanimoto
+                 + reward_similarity_weight * tanimoto
                  + reward_exact_match_weight * float(is_exact_list[b]))
             rewards[b] = r
             similarity_sum += tanimoto
@@ -3695,7 +3649,7 @@ def compute_mrt_loss(
         for b in range(total_seqs):
             edit_sim = _levenshtein_similarity(sampled_smiles[b], gt_canonical[b])
             r = (reward_validity_weight * float(is_valid_list[b])
-                 + reward_tanimoto_weight * edit_sim
+                 + reward_similarity_weight * edit_sim
                  + reward_exact_match_weight * float(is_exact_list[b]))
             rewards[b] = r
             similarity_sum += edit_sim
@@ -3747,7 +3701,7 @@ def compute_mrt_loss(
         for b in range(total_seqs):
             visual_sim = cos_sims[b].item()
             r = (reward_validity_weight * float(is_valid_list[b])
-                 + reward_tanimoto_weight * visual_sim
+                 + reward_similarity_weight * visual_sim
                  + reward_exact_match_weight * float(is_exact_list[b]))
             rewards[b] = r
             similarity_sum += visual_sim
@@ -3812,922 +3766,7 @@ def compute_mrt_loss(
 
     return mrt_loss, info
 
-
-# ======================== RL Finetuning Training Loop ========================
-
-def train_rl_finetune(
-    # data
-    smiles_list: List[str],
-    smiles_num: int,
-    # training
-    save_path: str,
-    pretrained_path: str,
-    num_epochs: int = 10,
-    batch_size: int = 32,
-    encoder_lr: float = 1e-5,
-    decoder_lr: float = 1e-5,
-    weight_decay: float = 1e-6,
-    warmup_ratio: float = 0.02,
-    seed: int = 2026,
-    early_stopping_patience: int = 10,
-    # Validation
-    benchmark_dir: str = '',
-    benchmark_csv_path: str = '',
-    val_max_samples: Optional[int] = None,
-    # Molecule
-    max_atoms: int = 100,
-    mol_augment: bool = True,
-    # Vision encoder
-    image_size: Tuple[int, int] = (384, 384),
-    n_bins: int = 64,
-    backbone: str = 'swin_b',
-    # decoder
-    d_model: int = 256,
-    nhead: int = 8,
-    num_decoder_layers: int = 6,
-    dim_feedforward: int = 1024,
-    dropout: float = 0.1,
-    # ===== Loss weights =====
-    token_loss_weight: float = 1.0,
-    bond_loss_weight: float = 1.0,
-    # ===== RL hyperparameters =====
-    alpha_rl_max: float = 0.5,
-    alpha_rl_warmup_epochs: int = 3,
-    rl_every_n_steps: int = 5,
-    rl_max_len: int = 500,
-    rl_temperature: float = 0.8,
-    rl_n_samples: int = 1,
-    rl_subsample: int = 16,
-    # ===== Composite reward weights =====
-    reward_validity_weight: float = 0.1,
-    reward_tanimoto_weight: float = 0.5,
-    reward_exact_match_weight: float = 0.4,
-    # ===== Reward mode =====
-    reward_mode: str = 'tanimoto',
-    # ===== Hard-example mining =====
-    hard_mining: bool = False,
-    # ===== RL method =====
-    rl_method: str = 'reinforce',
-    mrt_alpha: float = 1.0,
-    # ===== optimization =====
-    num_workers: int = 4,
-    use_amp: bool = True,
-    use_gradient_checkpointing: bool = False,
-    force_cpu: bool = False,
-    # ===== resume =====
-    resume_from: Optional[str] = None,
-) -> List[float]:
-    """RL finetuning loop: MLE + sequence-level loss with DDP support.
-
-    Loads a pretrained MolScribe model and finetunes it with a combined loss:
-
-        L_total = w_t·L_token + w_b·L_bond + α(t) · L_seq
-
-    where L_seq is either REINFORCE or MRT (selected by ``rl_method``),
-    and α(t) is linearly annealed from 0 → alpha_rl_max over
-    alpha_rl_warmup_epochs, then held constant.
-
-    Sequence-level methods (``rl_method``):
-
-      - ``'reinforce'``: REINFORCE with self-critical baseline.
-        High variance; best for early-stage models far from convergence.
-
-      - ``'mrt'``: Minimum Risk Training.  Softmax-weighted cost over N
-        candidates.  Lower variance, per-token gradient signal via
-        pathwise derivatives through the softmax weights.  Preferred
-        for near-converged models.
-
-    The reward depends on ``reward_mode``:
-
-      - ``'tanimoto'``:  R = w_v·𝟙[valid] + w_sim·Tanimoto + w_e·𝟙[exact]
-      - ``'edit_distance'``: R = w_v·𝟙[valid] + w_sim·LevenshteinSim + w_e·𝟙[exact]
-      - ``'visual'``:  R = w_v·𝟙[valid] + w_sim·CosineSim(enc(render(pred)), enc(gt)) + w_e·𝟙[exact]
-
-    This provides gradient signal at three granularities:
-      - Validity bonus: coarse signal even for badly wrong predictions
-      - Tanimoto: smooth, continuous similarity signal
-      - Exact match: sharp bonus for perfect predictions
-
-    To manage the cost of autoregressive sampling, RL loss is computed
-    only every ``rl_every_n_steps`` MLE steps.
-
-    Launch with:
-        torchrun --nproc_per_node=<N_GPUS> train_rl_finetune.py
-
-    Args:
-        pretrained_path: Path to .pth file with pretrained model weights.
-        alpha_rl_max: Maximum RL loss weight after warmup.
-        alpha_rl_warmup_epochs: Epochs over which to linearly anneal α.
-        rl_every_n_steps: Compute RL loss every N training steps.
-        rl_max_len: Max sequence length for RL autoregressive sampling.
-        rl_temperature: Sampling temperature for RL exploration.
-        rl_n_samples: Number of samples per image in REINFORCE (>1 enables self-critical).
-        reward_validity_weight: Weight for valid-SMILES indicator in reward.
-        reward_tanimoto_weight: Weight for Tanimoto similarity in reward.
-        reward_exact_match_weight: Weight for exact-match indicator in reward.
-        (other args same as train())
-    """
-    # ===== DDP setup =====
-    local_rank = int(os.environ.get('LOCAL_RANK', 0))
-    world_size = int(os.environ.get('WORLD_SIZE', 1))
-
-    # Install crash handler: print full traceback + GPU memory on unhandled exceptions
-    import sys, traceback as _tb
-    _orig_excepthook = sys.excepthook
-    def _crash_handler(exc_type, exc_value, exc_tb):
-        print(f"\n{'='*60}", flush=True)
-        print(f"[Rank {local_rank}] UNHANDLED EXCEPTION:", flush=True)
-        _tb.print_exception(exc_type, exc_value, exc_tb)
-        if torch.cuda.is_available():
-            try:
-                dev = torch.device(f'cuda:{local_rank}')
-                alloc = torch.cuda.memory_allocated(dev) / 1e9
-                reserved = torch.cuda.memory_reserved(dev) / 1e9
-                print(f"[Rank {local_rank}] GPU memory: {alloc:.2f}GB alloc / {reserved:.2f}GB reserved", flush=True)
-            except Exception:
-                pass
-        print(f"{'='*60}\n", flush=True)
-        _orig_excepthook(exc_type, exc_value, exc_tb)
-    sys.excepthook = _crash_handler
-
-    if force_cpu or not torch.cuda.is_available():
-        device = torch.device('cpu')
-        use_amp = False
-        if is_main_process():
-            print('Forcing CPU mode')
-    else:
-        if world_size > 1:
-            setup_ddp(local_rank, world_size)
-        device = torch.device(f'cuda:{local_rank}')
-        torch.cuda.set_device(device)
-
-    if is_main_process():
-        if world_size > 1:
-            print(f'DDP RL Finetuning: {world_size} GPUs')
-            for i in range(world_size):
-                print(f'  GPU {i}: {torch.cuda.get_device_name(i)}')
-        else:
-            print(f'Single GPU RL finetuning on: {device}')
-        effective_batch = batch_size * world_size
-        print(f'Per-GPU batch size: {batch_size}, Effective batch size: {effective_batch}')
-        print(f'RL config: method={rl_method}, alpha_rl_max={alpha_rl_max}, warmup={alpha_rl_warmup_epochs}ep, '
-              f'every_n={rl_every_n_steps}, temp={rl_temperature}, n_samples={rl_n_samples}, '
-              f'subsample={rl_subsample}, max_len={rl_max_len}')
-        if rl_method == 'mrt':
-            print(f'MRT alpha (sharpness): {mrt_alpha}')
-        print(f'Composite reward weights: validity={reward_validity_weight}, '
-              f'similarity={reward_tanimoto_weight}, exact_match={reward_exact_match_weight}')
-        print(f'Reward mode: {reward_mode}  |  Hard-example mining: {hard_mining}')
-        print(f'Loss weights: token={token_loss_weight}, bond={bond_loss_weight}')
-        print(f'Pretrained model: {pretrained_path}')
-
-    # Seed
-    torch.manual_seed(seed)
-    np.random.seed(seed + local_rank)
-    random.seed(seed + local_rank)
-
-    # Vocab
-    vocab = MolScannerVocab(n_bins=n_bins)
-    if is_main_process():
-        print(f'Vocab size: {len(vocab)}')
-
-    # Prepare training data
-    n = len(smiles_list)
-    rng = np.random.default_rng(seed)
-    indices = np.arange(n)
-    rng.shuffle(indices)
-    indices = indices[:smiles_num]
-    train_smiles = [smiles_list[i] for i in indices]
-
-    if is_main_process():
-        print(f'Train size: {len(train_smiles)}')
-
-    # Dataset
-    train_dataset = MoleculeDataset(
-        smiles_list=train_smiles,
-        shuffle_smiles=True,
-        vocab=vocab,
-        image_size=image_size,
-        mol_augment=mol_augment,
-        geo_augment=True,
-        img_augment=True,
-    )
-
-    bond_class_weights = get_bond_class_weights()
-
-    # Sampler
-    train_sampler = DistributedSampler(
-        train_dataset, num_replicas=world_size, rank=local_rank,
-        shuffle=True, seed=seed,
-    ) if world_size > 1 else None
-
-    dl_common = {
-        'batch_size': batch_size,
-        'num_workers': num_workers,
-        'pin_memory': device.type == 'cuda',
-        'collate_fn': partial(collate_fn, vocab=vocab, max_atoms_limit=max_atoms),
-        'shuffle': (train_sampler is None),
-        'sampler': train_sampler,
-        'drop_last': True,
-    }
-    if num_workers > 0:
-        dl_common.update({
-            'prefetch_factor': 4,
-            'persistent_workers': False,
-            'multiprocessing_context': 'forkserver',
-            'timeout': 60,
-        })
-
-    def _make_loader():
-        return DataLoader(train_dataset, **dl_common)
-
-    train_loader = _make_loader()
-
-    # ===== Model (load pretrained) =====
-    model = MolScribeModel(
-        vocab=vocab,
-        backbone=backbone,
-        pretrained=False,  # will load weights from checkpoint
-        d_model=d_model,
-        nhead=nhead,
-        num_decoder_layers=num_decoder_layers,
-        dim_feedforward=dim_feedforward,
-        dropout=dropout,
-        use_gradient_checkpointing=use_gradient_checkpointing,
-    ).to(device)
-
-    # Load pretrained weights
-    if is_main_process():
-        print(f'Loading pretrained weights from {pretrained_path} ...')
-    model.load_model(pretrained_path, device=device)
-
-    # ===== Frozen reference encoder for stable visual reward =====
-    # Deep-copy encoder + pos_enc before any training updates.  These copies
-    # stay fixed throughout RL finetuning so the visual similarity reward
-    # is measured on a stable, non-drifting feature space.
-    import copy
-    frozen_encoder = copy.deepcopy(model.image_encoder).eval()
-    frozen_pos_enc = copy.deepcopy(model.pos_enc_2d).eval()
-    frozen_encoder.requires_grad_(False)
-    frozen_pos_enc.requires_grad_(False)
-    if is_main_process():
-        print('Created frozen reference encoder for visual reward')
-
-    # Wrap with DDP — find_unused_parameters=False is safe because the DDP
-    # forward call is only used for MLE (encoder + decoder + bond_predictor,
-    # all parameters exercised). The RL path bypasses DDP via actual_model.
-    if world_size > 1:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False,
-                    gradient_as_bucket_view=True)
-
-    actual_model = model.module if hasattr(model, 'module') else model
-
-    # ===== Optimizer (smaller LR for finetuning) =====
-    encoder_param_ids = {id(p) for p in actual_model.image_encoder.parameters()}
-    encoder_params = [p for p in actual_model.parameters() if id(p) in encoder_param_ids]
-    decoder_params = [p for p in actual_model.parameters() if id(p) not in encoder_param_ids]
-
-    optimizer = torch.optim.AdamW([
-        {'params': encoder_params, 'lr': encoder_lr, 'weight_decay': weight_decay},
-        {'params': decoder_params, 'lr': decoder_lr, 'weight_decay': weight_decay},
-    ])
-
-    # Scheduler (cosine with warmup)
-    steps_per_epoch = len(train_loader)
-    total_steps = steps_per_epoch * num_epochs
-    warmup_steps = int(total_steps * warmup_ratio)
-
-    if is_main_process():
-        print(f'Steps/epoch: {steps_per_epoch}, Total steps: {total_steps}, '
-              f'Warmup steps: {warmup_steps}')
-
-    def lr_lambda(current_step: int) -> float:
-        if current_step < warmup_steps:
-            return float(current_step) / float(max(1, warmup_steps))
-        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        return max(0.0, 0.5 * (1.0 + np.cos(np.pi * progress)))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    scaler = torch.amp.GradScaler('cuda') if (use_amp and device.type == 'cuda') else None
-
-    # ===== Resume from RL finetuning checkpoint =====
-    start_epoch = 1
-    best_val_acc = 0.0
-    epochs_no_improve = 0
-    rl_baseline_ema = 0.0  # exponential moving average of rewards
-    resume_log_dir = None
-
-    if resume_from is not None and os.path.isfile(resume_from):
-        if is_main_process():
-            print(f'Resuming RL finetuning from {resume_from}')
-        ckpt = torch.load(resume_from, map_location=device, weights_only=False)
-        actual_model.load_state_dict(ckpt['model_state_dict'])
-        
-        # Restore optimizer / scheduler / scaler
-        if ckpt.get('optimizer_state_dict') is not None:
-            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        if ckpt.get('scheduler_state_dict') is not None:
-            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-        if scaler is not None and ckpt.get('scaler_state_dict') is not None:
-            scaler.load_state_dict(ckpt['scaler_state_dict'])
-        
-        # Restore training state — always resume from the next full epoch
-        saved_epoch = ckpt.get('epoch', 0)
-        start_epoch = saved_epoch + 1
-        best_val_acc = ckpt.get('best_val_acc', 0.0)
-        epochs_no_improve = ckpt.get('epochs_no_improve', 0)
-        rl_baseline_ema = ckpt.get('rl_baseline_ema', 0.0)
-        resume_log_dir = ckpt.get('log_dir', None)
-        
-        if is_main_process():
-            print(f'  Loaded epoch {saved_epoch}, resuming from epoch {start_epoch}')
-            print(f'  best_val_acc={best_val_acc:.4f}, rl_baseline_ema={rl_baseline_ema:.4f}')
-        del ckpt
-        torch.cuda.empty_cache()
-    
-    # Recompute global_step from start_epoch
-    global_step = (start_epoch - 1) * steps_per_epoch
-
-    # TensorBoard
-    writer = None
-    if is_main_process():
-        os.makedirs(save_path, exist_ok=True)
-        if resume_log_dir and os.path.isdir(resume_log_dir):
-            log_dir = resume_log_dir
-            print(f'TensorBoard logs (resumed): {log_dir}')
-        else:
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            log_dir = os.path.join(save_path, 'logs', f'rl_{timestamp}')
-            print(f'TensorBoard logs: {log_dir}')
-        writer = SummaryWriter(log_dir=log_dir)
-
-        # ===== Save hyperparameters for this run =====
-        hparams = {
-            'batch_size': batch_size,
-            'effective_batch_size': batch_size * world_size,
-            'encoder_lr': encoder_lr,
-            'decoder_lr': decoder_lr,
-            'weight_decay': weight_decay,
-            'warmup_ratio': warmup_ratio,
-            'num_epochs': num_epochs,
-            'smiles_num': smiles_num,
-            'max_atoms': max_atoms,
-            'mol_augment': mol_augment,
-            'image_size': str(image_size),
-            'n_bins': n_bins,
-            'backbone': backbone,
-            'd_model': d_model,
-            'nhead': nhead,
-            'num_decoder_layers': num_decoder_layers,
-            'dim_feedforward': dim_feedforward,
-            'dropout': dropout,
-            'token_loss_weight': token_loss_weight,
-            'bond_loss_weight': bond_loss_weight,
-            'rl_method': rl_method,
-            'alpha_rl_max': alpha_rl_max,
-            'alpha_rl_warmup_epochs': alpha_rl_warmup_epochs,
-            'rl_every_n_steps': rl_every_n_steps,
-            'rl_max_len': rl_max_len,
-            'rl_temperature': rl_temperature,
-            'rl_n_samples': rl_n_samples,
-            'rl_subsample': rl_subsample,
-            'reward_mode': reward_mode,
-            'reward_validity_weight': reward_validity_weight,
-            'reward_tanimoto_weight': reward_tanimoto_weight,
-            'reward_exact_match_weight': reward_exact_match_weight,
-            'hard_mining': hard_mining,
-            'mrt_alpha': mrt_alpha if rl_method == 'mrt' else None,
-            'seed': seed,
-            'pretrained_path': pretrained_path,
-        }
-        # 1) Save as YAML file in the log directory
-        import json
-        hparams_path = os.path.join(log_dir, 'hparams.json')
-        with open(hparams_path, 'w') as f:
-            json.dump(hparams, f, indent=2)
-        # 2) Log as TensorBoard text for easy viewing
-        hparams_md = '| Param | Value |\n|---|---|\n'
-        for k, v in hparams.items():
-            hparams_md += f'| {k} | {v} |\n'
-        writer.add_text('Hyperparameters', hparams_md, global_step=0)
-    else:
-        log_dir = None
-
-    # Broadcast log_dir to all ranks
-    if world_size > 1:
-        if is_main_process():
-            log_dir_bytes = log_dir.encode('utf-8')
-            log_dir_len = torch.tensor([len(log_dir_bytes)], dtype=torch.long, device=device)
-        else:
-            log_dir_len = torch.tensor([0], dtype=torch.long, device=device)
-        dist.broadcast(log_dir_len, src=0)
-        if is_main_process():
-            log_dir_tensor = torch.tensor(list(log_dir_bytes), dtype=torch.uint8, device=device)
-        else:
-            log_dir_tensor = torch.zeros(int(log_dir_len.item()), dtype=torch.uint8, device=device)
-        dist.broadcast(log_dir_tensor, src=0)
-        if not is_main_process():
-            log_dir = bytes(log_dir_tensor.cpu().tolist()).decode('utf-8')
-
-    # Helper: compute alpha_rl at a given epoch
-    def _get_alpha_rl(epoch: int) -> float:
-        if alpha_rl_warmup_epochs <= 0:
-            return alpha_rl_max
-        progress = min(1.0, (epoch - 1) / alpha_rl_warmup_epochs)
-        return alpha_rl_max * progress
-
-    # ===== Hard-example mining buffer =====
-    # Between RL steps, we accumulate the hardest samples (highest per-sample
-    # MLE token loss) on CPU.  At the RL step, we use these instead of
-    # random images from the current batch so that RL focuses on what the
-    # model currently struggles with.
-    import heapq  # min-heap for efficient top-K tracking
-
-    # Buffer stores (loss, counter, images_cpu, gt_smiles).
-    # heapq is a min-heap; the counter acts as a tiebreaker so that
-    # tensor elements are never compared (which would raise an error).
-    _hard_buffer: List[Tuple[float, int, torch.Tensor, str]] = []
-    _hard_counter = 0
-
-    # ===== Training Loop =====
-    for epoch in range(start_epoch, num_epochs + 1):
-        model.train()
-        if train_sampler is not None:
-            train_sampler.set_epoch(epoch)
-
-        current_alpha = _get_alpha_rl(epoch)
-        if is_main_process():
-            print(f'\nEpoch {epoch}/{num_epochs}  alpha_rl={current_alpha:.4f}  '
-                  f'rl_baseline_ema={rl_baseline_ema:.4f}')
-
-        running_loss = 0.0
-        running_rl_loss = 0.0
-        running_reward = 0.0
-        num_batches = 0
-        num_rl_steps = 0
-
-        steps_in_epoch = len(train_loader)
-        train_bar = tqdm(total=steps_in_epoch, desc=f'Epoch {epoch} [RL-FT]',
-                         disable=not is_main_process())
-        train_iter = iter(train_loader)
-
-        for _step in range(steps_in_epoch):
-            try:
-                batch = next(train_iter)
-            except StopIteration:
-                break
-            except (RuntimeError, OSError, BrokenPipeError) as e:
-                if is_main_process():
-                    warnings.warn(f"DataLoader error at epoch {epoch} step {_step}: {e}")
-                batch = None
-                del train_iter
-                train_loader = _make_loader()
-                train_iter = iter(train_loader)
-
-            # DDP-safe batch validity
-            batch_valid = batch is not None
-            if world_size > 1:
-                valid_tensor = torch.tensor([1 if batch_valid else 0],
-                                           dtype=torch.int32, device=device)
-                dist.all_reduce(valid_tensor, op=dist.ReduceOp.MIN)
-                batch_valid = valid_tensor.item() == 1
-            if not batch_valid:
-                train_bar.update(1)
-                continue
-
-            images = batch['images'].to(device, non_blocking=True).contiguous()
-            tgt_tokens = batch['tgt_tokens'].to(device, non_blocking=True).contiguous()
-            tgt_padding_mask = batch['tgt_padding_mask'].to(device, non_blocking=True).contiguous()
-            atom_indices = batch['atom_indices'].to(device, non_blocking=True).contiguous()
-            atom_mask = batch['atom_mask'].to(device, non_blocking=True).contiguous()
-            max_atoms_val = batch['max_atoms']
-            bond_matrices_list = batch['bond_matrices_list']
-
-            # Truncate if needed (safety net; collate_fn already filters > 600)
-            tgt_tokens, tgt_padding_mask, atom_indices, atom_mask = truncate_sequences(
-                tgt_tokens, tgt_padding_mask, atom_indices, atom_mask, max_seq_len=600
-            )
-
-            tgt_input = tgt_tokens[:, :-1].contiguous()
-            tgt_target = tgt_tokens[:, 1:].contiguous()
-            tgt_input_mask = tgt_padding_mask[:, :-1].contiguous()
-
-            optimizer.zero_grad(set_to_none=True)
-
-            # Determine whether this step includes RL loss
-            do_rl = (current_alpha > 0) and (_step % rl_every_n_steps == 0)
-
-            # Max images used for RL sampling (caps memory)
-            rl_subsample_actual = min(rl_subsample, images.size(0))
-
-            # ---------- Phase 1: MLE forward + backward (separate from RL) ----------
-            if scaler is not None:
-                with torch.amp.autocast('cuda'):
-                    token_logits, edge_logits, _hidden = model(
-                        images=images,
-                        tgt_tokens=tgt_input,
-                        tgt_key_padding_mask=tgt_input_mask,
-                        atom_indices=atom_indices,
-                        atom_mask=atom_mask,
-                        max_atoms=max_atoms_val,
-                    )
-                    del _hidden
-
-                    mle_losses = compute_losses(
-                        token_logits=token_logits,
-                        edge_logits=edge_logits,
-                        tgt_tokens=tgt_target,
-                        bond_matrices_list=bond_matrices_list,
-                        vocab=vocab,
-                        bond_class_weights=bond_class_weights,
-                    )
-                    mle_loss = (token_loss_weight * mle_losses['token_loss']
-                                + bond_loss_weight * mle_losses['bond_loss'])
-
-                # --- Hard-example mining: compute per-sample loss before freeing graph ---
-                if hard_mining and not do_rl:
-                    with torch.no_grad():
-                        B_cur, T_cur, V_cur = token_logits.shape
-                        per_tok = F.cross_entropy(
-                            token_logits.reshape(-1, V_cur),
-                            tgt_target.reshape(-1),
-                            ignore_index=vocab.pad_idx,
-                            reduction='none',
-                        ).reshape(B_cur, T_cur)
-                        valid_mask = (tgt_target != vocab.pad_idx).float()
-                        per_sample_loss = (per_tok * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1)
-
-                    for b_idx in range(B_cur):
-                        loss_val = per_sample_loss[b_idx].item()
-                        seq_b = tgt_tokens[b_idx].tolist()
-                        res_b = vocab.sequence_to_smiles(seq_b)
-                        gt_smi = res_b.get('smiles', '')
-                        item = (loss_val, _hard_counter, images[b_idx].detach().cpu(), gt_smi)
-                        _hard_counter += 1
-                        if len(_hard_buffer) < rl_subsample:
-                            heapq.heappush(_hard_buffer, item)
-                        elif loss_val > _hard_buffer[0][0]:
-                            heapq.heapreplace(_hard_buffer, item)
-
-                # MLE backward — free the MLE graph before RL
-                scaler.scale(mle_loss).backward()
-                del token_logits, edge_logits, mle_loss
-                torch.cuda.empty_cache()
-
-                # ---------- Phase 2: RL forward + backward (every N steps) ----------
-                rl_loss_val = torch.tensor(0.0, device=device)
-                rl_reward = 0.0
-                if do_rl:
-                    # --- Select images for RL ---
-                    if hard_mining and _hard_buffer:
-                        hard_sorted = sorted(_hard_buffer, key=lambda x: x[0], reverse=True)
-                        rl_images = torch.stack([h[2] for h in hard_sorted[:rl_subsample_actual]]).to(device)
-                        gt_smiles_batch = [h[3] for h in hard_sorted[:rl_subsample_actual]]
-                        _hard_buffer.clear()
-                    else:
-                        # Fallback: use current batch (when hard_mining off, or buffer empty)
-                        rl_images = images[:rl_subsample_actual]
-                        gt_smiles_batch = []
-                        for b in range(rl_subsample_actual):
-                            seq_b = tgt_tokens[b].tolist()
-                            res = vocab.sequence_to_smiles(seq_b)
-                            gt_smiles_batch.append(res.get('smiles', ''))
-
-                    # Encode images for RL (fp32 for stability)
-                    # Detach encoder features: RL only trains the decoder.
-                    # This prevents the N-fold gradient amplification through
-                    # repeat_interleave(n_samples) which destabilises the encoder.
-                    with torch.no_grad():
-                        img_features = actual_model.image_encoder(rl_images)
-                        img_features = actual_model.pos_enc_2d(img_features)
-                    img_features = img_features.float().detach()
-
-                    if rl_method == 'mrt':
-                        rl_loss, rl_info = compute_mrt_loss(
-                            model=actual_model,
-                            img_features=img_features,
-                            gt_smiles_list=gt_smiles_batch,
-                            vocab=vocab,
-                            device=device,
-                            max_len=rl_max_len,
-                            temperature=rl_temperature,
-                            n_samples=rl_n_samples,
-                            mrt_alpha=mrt_alpha,
-                            reward_validity_weight=reward_validity_weight,
-                            reward_tanimoto_weight=reward_tanimoto_weight,
-                            reward_exact_match_weight=reward_exact_match_weight,
-                            reward_mode=reward_mode,
-                            frozen_encoder=frozen_encoder,
-                            frozen_pos_enc=frozen_pos_enc,
-                        )
-                    else:
-                        rl_loss, rl_info = compute_reinforce_tanimoto_loss(
-                            model=actual_model,
-                            img_features=img_features,
-                            gt_smiles_list=gt_smiles_batch,
-                            vocab=vocab,
-                            device=device,
-                            max_len=rl_max_len,
-                            baseline=rl_baseline_ema,
-                            temperature=rl_temperature,
-                            n_samples=rl_n_samples,
-                            reward_validity_weight=reward_validity_weight,
-                            reward_tanimoto_weight=reward_tanimoto_weight,
-                            reward_exact_match_weight=reward_exact_match_weight,
-                            reward_mode=reward_mode,
-                            frozen_encoder=frozen_encoder,
-                            frozen_pos_enc=frozen_pos_enc,
-                        )
-                    rl_loss_val = rl_loss
-                    rl_reward = rl_info['mean_reward']
-
-                    # RL backward — gradients accumulate with MLE grads
-                    scaled_rl = current_alpha * rl_loss_val
-                    scaler.scale(scaled_rl).backward()
-                    del img_features, rl_loss, scaled_rl
-                    torch.cuda.empty_cache()
-
-                    # Update EMA baseline
-                    rl_baseline_ema = 0.9 * rl_baseline_ema + 0.1 * rl_reward
-
-                # Clip & step (accumulated MLE + RL gradients)
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-
-                mle_loss_val = (token_loss_weight * mle_losses['token_loss'].item()
-                                + bond_loss_weight * mle_losses['bond_loss'].item())
-                total_loss_val = mle_loss_val + current_alpha * rl_loss_val.item()
-            else:
-                token_logits, edge_logits, _hidden = model(
-                    images=images,
-                    tgt_tokens=tgt_input,
-                    tgt_key_padding_mask=tgt_input_mask,
-                    atom_indices=atom_indices,
-                    atom_mask=atom_mask,
-                    max_atoms=max_atoms_val,
-                )
-                del _hidden
-
-                mle_losses = compute_losses(
-                    token_logits=token_logits,
-                    edge_logits=edge_logits,
-                    tgt_tokens=tgt_target,
-                    bond_matrices_list=bond_matrices_list,
-                    vocab=vocab,
-                    bond_class_weights=bond_class_weights,
-                )
-                mle_loss = (token_loss_weight * mle_losses['token_loss']
-                            + bond_loss_weight * mle_losses['bond_loss'])
-
-                # --- Hard-example mining: compute per-sample loss before freeing graph ---
-                if hard_mining and not do_rl:
-                    with torch.no_grad():
-                        B_cur, T_cur, V_cur = token_logits.shape
-                        per_tok = F.cross_entropy(
-                            token_logits.reshape(-1, V_cur),
-                            tgt_target.reshape(-1),
-                            ignore_index=vocab.pad_idx,
-                            reduction='none',
-                        ).reshape(B_cur, T_cur)
-                        valid_mask = (tgt_target != vocab.pad_idx).float()
-                        per_sample_loss = (per_tok * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1)
-
-                    for b_idx in range(B_cur):
-                        loss_val = per_sample_loss[b_idx].item()
-                        seq_b = tgt_tokens[b_idx].tolist()
-                        res_b = vocab.sequence_to_smiles(seq_b)
-                        gt_smi = res_b.get('smiles', '')
-                        item = (loss_val, _hard_counter, images[b_idx].detach().cpu(), gt_smi)
-                        _hard_counter += 1
-                        if len(_hard_buffer) < rl_subsample:
-                            heapq.heappush(_hard_buffer, item)
-                        elif loss_val > _hard_buffer[0][0]:
-                            heapq.heapreplace(_hard_buffer, item)
-
-                # MLE backward first — free graph before RL
-                mle_loss.backward()
-                del token_logits, edge_logits, mle_loss
-                torch.cuda.empty_cache()
-
-                rl_loss_val = torch.tensor(0.0, device=device)
-                rl_reward = 0.0
-                if do_rl:
-                    # --- Select images for RL ---
-                    if hard_mining and _hard_buffer:
-                        hard_sorted = sorted(_hard_buffer, key=lambda x: x[0], reverse=True)
-                        rl_images = torch.stack([h[2] for h in hard_sorted[:rl_subsample_actual]]).to(device)
-                        gt_smiles_batch = [h[3] for h in hard_sorted[:rl_subsample_actual]]
-                        _hard_buffer.clear()
-                    else:
-                        # Fallback: use current batch (when hard_mining off, or buffer empty)
-                        rl_images = images[:rl_subsample_actual]
-                        gt_smiles_batch = []
-                        for b in range(rl_subsample_actual):
-                            seq_b = tgt_tokens[b].tolist()
-                            res = vocab.sequence_to_smiles(seq_b)
-                            gt_smiles_batch.append(res.get('smiles', ''))
-
-                    # Detach encoder features: RL only trains the decoder.
-                    with torch.no_grad():
-                        img_features = actual_model.image_encoder(rl_images)
-                        img_features = actual_model.pos_enc_2d(img_features)
-                    img_features = img_features.float().detach()
-
-                    if rl_method == 'mrt':
-                        rl_loss, rl_info = compute_mrt_loss(
-                            model=actual_model,
-                            img_features=img_features,
-                            gt_smiles_list=gt_smiles_batch,
-                            vocab=vocab,
-                            device=device,
-                            max_len=rl_max_len,
-                            temperature=rl_temperature,
-                            n_samples=rl_n_samples,
-                            mrt_alpha=mrt_alpha,
-                            reward_validity_weight=reward_validity_weight,
-                            reward_tanimoto_weight=reward_tanimoto_weight,
-                            reward_exact_match_weight=reward_exact_match_weight,
-                            reward_mode=reward_mode,
-                            frozen_encoder=frozen_encoder,
-                            frozen_pos_enc=frozen_pos_enc,
-                        )
-                    else:
-                        rl_loss, rl_info = compute_reinforce_tanimoto_loss(
-                            model=actual_model,
-                            img_features=img_features,
-                            gt_smiles_list=gt_smiles_batch,
-                            vocab=vocab,
-                            device=device,
-                            max_len=rl_max_len,
-                            baseline=rl_baseline_ema,
-                            temperature=rl_temperature,
-                            n_samples=rl_n_samples,
-                            reward_validity_weight=reward_validity_weight,
-                            reward_tanimoto_weight=reward_tanimoto_weight,
-                            reward_exact_match_weight=reward_exact_match_weight,
-                            reward_mode=reward_mode,
-                            frozen_encoder=frozen_encoder,
-                            frozen_pos_enc=frozen_pos_enc,
-                        )
-                    rl_loss_val = rl_loss
-                    rl_reward = rl_info['mean_reward']
-                    (current_alpha * rl_loss_val).backward()
-                    del img_features, rl_loss
-                    torch.cuda.empty_cache()
-                    rl_baseline_ema = 0.9 * rl_baseline_ema + 0.1 * rl_reward
-
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-
-                mle_loss_val = (token_loss_weight * mle_losses['token_loss'].item()
-                                + bond_loss_weight * mle_losses['bond_loss'].item())
-                total_loss_val = mle_loss_val + current_alpha * rl_loss_val.item()
-
-            scheduler.step()
-
-            running_loss += total_loss_val
-            num_batches += 1
-            global_step += 1
-
-            if do_rl:
-                running_rl_loss += rl_loss_val.item()
-                running_reward += rl_reward
-                num_rl_steps += 1
-
-            # Logging
-            if is_main_process():
-                postfix = {
-                    'loss': f"{total_loss_val:.2f}",
-                    't': f"{mle_losses['token_loss'].item():.2f}",
-                    'b': f"{mle_losses['bond_loss'].item():.2f}",
-                }
-                if do_rl:
-                    postfix['rl'] = f"{rl_loss_val.item():.2f}"
-                    postfix['R'] = f"{rl_reward:.3f}"
-                train_bar.set_postfix(postfix)
-
-                writer.add_scalar('Loss/train_total', total_loss_val, global_step)
-                writer.add_scalar('Loss/train_token', mle_losses['token_loss'].item(), global_step)
-                writer.add_scalar('Loss/train_bond', mle_losses['bond_loss'].item(), global_step)
-                if do_rl:
-                    writer.add_scalar('Loss/rl_reinforce', rl_loss_val.item(), global_step)
-                    writer.add_scalar('RL/reward_composite', rl_reward, global_step)
-                    writer.add_scalar('RL/similarity', rl_info.get('mean_similarity', 0.0), global_step)
-                    # Mode-specific similarity metrics
-                    if reward_mode == 'tanimoto':
-                        writer.add_scalar('RL/reward_tanimoto', rl_info.get('mean_tanimoto', 0.0), global_step)
-                    elif reward_mode == 'edit_distance':
-                        writer.add_scalar('RL/reward_edit_sim', rl_info.get('mean_edit_similarity', 0.0), global_step)
-                    elif reward_mode == 'visual':
-                        writer.add_scalar('RL/reward_visual_sim', rl_info.get('mean_visual_similarity', 0.0), global_step)
-                        writer.add_scalar('RL/render_success', rl_info.get('render_success', 0), global_step)
-                    writer.add_scalar('RL/exact_matches', rl_info.get('exact_matches', 0), global_step)
-                    writer.add_scalar('RL/valid_smiles', rl_info.get('valid_smiles_count', 0), global_step)
-                    writer.add_scalar('RL/baseline_ema', rl_baseline_ema, global_step)
-                    writer.add_scalar('RL/alpha', current_alpha, global_step)
-                current_lrs = scheduler.get_last_lr()
-                writer.add_scalar('LR/encoder', current_lrs[0], global_step)
-                writer.add_scalar('LR/decoder', current_lrs[1], global_step)
-
-            train_bar.update(1)
-
-        train_bar.close()
-
-        # End-of-epoch summary
-        avg_loss = running_loss / max(num_batches, 1)
-        avg_rl = running_rl_loss / max(num_rl_steps, 1)
-        avg_reward = running_reward / max(num_rl_steps, 1)
-        if is_main_process():
-            print(f'Epoch {epoch}: avg_loss={avg_loss:.4f}, avg_rl_loss={avg_rl:.4f}, '
-                  f'avg_reward={avg_reward:.4f}, rl_steps={num_rl_steps}')
-
-        # ===== Validation =====
-        val_metrics = validate(
-            model=model,
-            benchmark_dir=benchmark_dir,
-            benchmark_csv_path=benchmark_csv_path,
-            device=device,
-            epoch=epoch,
-            writer=writer,
-            global_step=global_step,
-            beam_size=1,
-            max_samples=val_max_samples,
-        )
-
-        if is_main_process():
-            val_acc = val_metrics['exact_match_acc']
-            model_to_save = model.module if hasattr(model, 'module') else model
-
-            if val_acc > best_val_acc:
-                epochs_no_improve = 0
-                best_val_acc = val_acc
-                torch.save(model_to_save.state_dict(), os.path.join(save_path, 'best.pth'))
-                print(f'New best model (exact_match_acc={best_val_acc:.4f})')
-            else:
-                epochs_no_improve += 1
-                print(f'No improvement for {epochs_no_improve} epoch(s).')
-
-            torch.save(model_to_save.state_dict(), os.path.join(save_path, f'epoch_{epoch}.pth'))
-
-            ckpt_state = {
-                'model_state_dict': model_to_save.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
-                'epoch': epoch,
-                'best_val_acc': best_val_acc,
-                'epochs_no_improve': epochs_no_improve,
-                'rl_baseline_ema': rl_baseline_ema,
-                'log_dir': log_dir,
-            }
-            torch.save(ckpt_state, os.path.join(save_path, 'checkpoint_resume.pth'))
-
-            should_stop = epochs_no_improve >= early_stopping_patience
-        else:
-            should_stop = False
-
-        if world_size > 1:
-            stop_tensor = torch.tensor([1 if should_stop else 0], device=device)
-            dist.broadcast(stop_tensor, src=0)
-            should_stop = stop_tensor.item() == 1
-
-        if should_stop:
-            if is_main_process():
-                print(f'Early stopping at epoch {epoch}.')
-                model_to_save = model.module if hasattr(model, 'module') else model
-                torch.save(model_to_save.state_dict(), os.path.join(save_path, 'final.pth'))
-                writer.close()
-            if world_size > 1:
-                dist.barrier()
-            del model, optimizer, scaler
-            torch.cuda.empty_cache()
-            cleanup_ddp()
-            return []
-
-        if world_size > 1:
-            dist.barrier()
-        model.train()
-
-    # Final save
-    if is_main_process():
-        model_to_save = model.module if hasattr(model, 'module') else model
-        torch.save(model_to_save.state_dict(), os.path.join(save_path, 'final.pth'))
-        writer.close()
-        print('RL finetuning complete!')
-
-    del model, optimizer, scaler
-    torch.cuda.empty_cache()
-
-    if world_size > 1:
-        dist.barrier()
-
-    cleanup_ddp()
-    return []
-
-
-# ======================== Real-Image RL Finetuning ========================
+# ======================== RL Finetuning on Real Images ========================
 
 class RealImageDataset(Dataset):
     """Dataset that loads real-world molecule images + GT SMILES from CSV.
@@ -4822,16 +3861,29 @@ def train_rl_real_finetune(
     # ===== Resume =====
     resume_from: Optional[str] = None,
 ) -> List[float]:
-    """Pure RL finetuning on real-world images.
+    """Pure RL finetuning on real-world molecule images (no MLE loss).
 
-    No MLE loss — only RL with configurable reward mode:
-      - 'visual': cycle-consistency cosine_sim(render(pred), render(gt))
-      - 'tanimoto': Morgan-fingerprint Tanimoto similarity
-      - 'edit_distance': normalized Levenshtein similarity
+    Finetunes a pretrained MolScribe model using only sequence-level RL
+    loss (REINFORCE or MRT) with a composite reward:
 
-    GT SMILES (from CSV) are used for:
-      - exact_match component of composite reward
-      - validation metric computation
+        R = w_v · 𝟙[valid] + w_sim · Similarity + w_e · 𝟙[exact match]
+
+    Reward modes (``reward_mode``):
+      - ``'visual'``: cycle-consistency — render pred & GT SMILES with
+        RDKit, encode with frozen reference encoder, compare via cosine
+        similarity. Works without GT SMILES labels (beyond exact match).
+      - ``'tanimoto'``: Morgan-fingerprint Tanimoto similarity.
+      - ``'edit_distance'``: normalized Levenshtein similarity.
+
+    RL methods (``rl_method``):
+      - ``'reinforce'``: REINFORCE with self-critical baseline.
+      - ``'mrt'``: Minimum Risk Training (lower variance, no baseline).
+
+    A frozen copy of the pretrained encoder provides stable visual reward
+    signals throughout training.
+
+    Launch:
+        torchrun --nproc_per_node=<N> MolScanner/train_rl_real.py
     """
     # ===== DDP setup =====
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
@@ -4923,7 +3975,7 @@ def train_rl_real_finetune(
         collate_fn=_real_collate_fn,
         drop_last=True,
         prefetch_factor=4 if num_workers > 0 else None,
-        persistent_workers=False,
+        persistent_workers=num_workers > 0,
     )
 
     # ===== Optimizer =====
@@ -4993,6 +4045,47 @@ def train_rl_real_finetune(
         writer = SummaryWriter(log_dir=log_dir)
         print(f'TensorBoard logs: {log_dir}')
 
+        # ===== Save hyperparameters =====
+        import json
+        hparams = {
+            'batch_size': batch_size,
+            'effective_batch_size': batch_size * world_size,
+            'encoder_lr': encoder_lr,
+            'decoder_lr': decoder_lr,
+            'weight_decay': weight_decay,
+            'warmup_ratio': warmup_ratio,
+            'num_epochs': num_epochs,
+            'image_size': str(image_size),
+            'n_bins': n_bins,
+            'backbone': backbone,
+            'd_model': d_model,
+            'nhead': nhead,
+            'num_decoder_layers': num_decoder_layers,
+            'dim_feedforward': dim_feedforward,
+            'dropout': dropout,
+            'rl_method': rl_method,
+            'rl_max_len': rl_max_len,
+            'rl_temperature': rl_temperature,
+            'rl_n_samples': rl_n_samples,
+            'rl_subsample': rl_subsample,
+            'reward_mode': reward_mode,
+            'reward_validity_weight': reward_validity_weight,
+            'reward_similarity_weight': reward_similarity_weight,
+            'reward_exact_match_weight': reward_exact_match_weight,
+            'mrt_alpha': mrt_alpha if rl_method == 'mrt' else None,
+            'seed': seed,
+            'pretrained_path': pretrained_path,
+            'train_csv_paths': train_csv_paths,
+            'train_images_total': len(train_dataset),
+        }
+        hparams_path = os.path.join(log_dir, 'hparams.json')
+        with open(hparams_path, 'w') as f:
+            json.dump(hparams, f, indent=2)
+        hparams_md = '| Param | Value |\n|---|---|\n'
+        for k, v in hparams.items():
+            hparams_md += f'| {k} | {v} |\n'
+        writer.add_text('Hyperparameters', hparams_md, global_step=0)
+
     # Broadcast log_dir to all ranks
     if world_size > 1:
         if is_main_process():
@@ -5055,14 +4148,14 @@ def train_rl_real_finetune(
                     n_samples=rl_n_samples,
                     mrt_alpha=mrt_alpha,
                     reward_validity_weight=reward_validity_weight,
-                    reward_tanimoto_weight=reward_similarity_weight,
+                    reward_similarity_weight=reward_similarity_weight,
                     reward_exact_match_weight=reward_exact_match_weight,
                     reward_mode=reward_mode,
                     frozen_encoder=frozen_encoder,
                     frozen_pos_enc=frozen_pos_enc,
                 )
             else:
-                rl_loss, rl_info = compute_reinforce_tanimoto_loss(
+                rl_loss, rl_info = compute_reinforce_loss(
                     model=actual_model,
                     img_features=img_features,
                     gt_smiles_list=rl_gt,
@@ -5073,7 +4166,7 @@ def train_rl_real_finetune(
                     temperature=rl_temperature,
                     n_samples=rl_n_samples,
                     reward_validity_weight=reward_validity_weight,
-                    reward_tanimoto_weight=reward_similarity_weight,
+                    reward_similarity_weight=reward_similarity_weight,
                     reward_exact_match_weight=reward_exact_match_weight,
                     reward_mode=reward_mode,
                     frozen_encoder=frozen_encoder,
@@ -5113,8 +4206,8 @@ def train_rl_real_finetune(
 
                 if writer:
                     writer.add_scalar('RL/reward_composite', rl_reward, global_step)
-                    writer.add_scalar('RL/visual_similarity',
-                                      rl_info.get('mean_visual_similarity', 0.0), global_step)
+                    writer.add_scalar('RL/similarity',
+                                      rl_info.get('mean_similarity', 0.0), global_step)
                     writer.add_scalar('RL/valid_smiles',
                                       rl_info.get('valid_smiles_count', 0), global_step)
                     writer.add_scalar('RL/exact_matches',
@@ -5125,6 +4218,8 @@ def train_rl_real_finetune(
                                       rl_info.get('render_success', 0), global_step)
                     writer.add_scalar('LR/encoder',
                                       optimizer.param_groups[0]['lr'], global_step)
+                    writer.add_scalar('LR/decoder',
+                                      optimizer.param_groups[1]['lr'], global_step)
 
         # ===== Epoch summary =====
         avg_reward = running_reward / max(num_batches, 1)
