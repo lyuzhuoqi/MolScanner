@@ -25,7 +25,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     project_dir = Path(__file__).parent.parent
-    log_dir = project_dir / "MolScanner" / "models" / "MolScribe_re"
+    log_dir = project_dir / "MolScanner" / "models" / "MolScribe_re_1M_synthetic"
     data_dir = project_dir / "data"
     file_path = data_dir / "pubchem_smiles/pubchem_smile_list.pkl"
     with open(file_path, 'rb') as f:
