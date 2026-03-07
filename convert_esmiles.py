@@ -61,9 +61,9 @@ def _normalize_label(label: str) -> str:
 
 
 def _validate_and_canonicalize(smiles: str, category: str):
-    """Canonicalize with ignore_cistrans=True (matching training pipeline)
+    """Canonicalize with ignore_cistrans=False (although it will be ignored during evaluation)
     and validate with full RDKit sanitization."""
-    canon, ok = canonicalize_smiles(smiles, ignore_cistrans=True)
+    canon, ok = canonicalize_smiles(smiles, ignore_cistrans=False)
     if not ok or not canon:
         return None, 'fail'
     if Chem.MolFromSmiles(canon) is None:
