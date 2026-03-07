@@ -27,12 +27,16 @@ from MolScribe_re_model import MolScannerVocab, MolScribeModel, evaluate_benchma
 STAGES = {
     'stage1_1M_synthetic': {
         'model_dir': 'MolScribe_re_1M_synthetic',
-        'description': 'Stage 1: 1M PubChem synthetic',
+        'description': 'Stage 1: 1M PubChem synthetic pre-training',
     },
     'stage2_680K_USPTO': {
         'model_dir': 'MolScribe_re_680K_USPTO',
-        'description': 'Stage 2: 680K USPTO fine-tune',
+        'description': 'Stage 2: 680K USPTO molfile pre-training',
     },
+    'stage3_82K_MolParser': {
+        'model_dir': 'MolScribe_re_82K_MolParser',
+        'description': 'Stage 3: 82K MolParser RL-based fine-tuning',
+    }
 }
 
 
