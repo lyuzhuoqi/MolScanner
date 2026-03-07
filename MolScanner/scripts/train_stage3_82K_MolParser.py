@@ -51,7 +51,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     data_dir = project_dir / "data"
-    log_dir = project_dir / "MolScanner" / "models" / "MolScribe_re_82K_MolParser"
+    log_dir = project_dir / "MolScanner" / "models" / "MolScribe_re_82K_MolParser" / args.reward_mode
     real_dir = data_dir / "benchmark" / "real"
 
     # ===== Determine checkpoint paths =====
