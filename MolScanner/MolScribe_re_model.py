@@ -667,6 +667,222 @@ class MoleculeDataset(Dataset):
             'success': True
         }
 
+# ======================== USPTO Mol-File Dataset ========================
+
+def normalize_nodes(nodes: np.ndarray, flip_y: bool = True) -> np.ndarray:
+    """Normalize node coordinates to [0, 1] based on bounding box.
+
+    Args:
+        nodes: (N, 2) array of coordinates.
+        flip_y: If True, flip Y axis (image convention: y=0 at top).
+    """
+    x, y = nodes[:, 0].copy(), nodes[:, 1].copy()
+    minx, maxx = x.min(), x.max()
+    miny, maxy = y.min(), y.max()
+    x = (x - minx) / max(maxx - minx, 1e-6)
+    if flip_y:
+        y = (maxy - y) / max(maxy - miny, 1e-6)
+    else:
+        y = (y - miny) / max(maxy - miny, 1e-6)
+    return np.stack([x, y], axis=1)
+
+
+class USPTOMolDataset(Dataset):
+    """Dataset that loads patent images + coordinates/edges from a CSV file.
+
+    Each row in the CSV has columns:
+        file_path   – path to the molecule image (absolute, or relative to *data_dir*)
+        SMILES      – ground truth SMILES string
+        node_coords – stringified list of [x, y] coordinates (in mol-file space)
+        edges       – (optional) stringified list of [u, v, bond_type] triples
+
+    Coordinates from mol files are in arbitrary space. They are normalised to
+    [0,1] via ``normalize_nodes``, then scaled to image pixel space before
+    augmentation.  After augmentation they are re-normalised to [0,1] and
+    quantised into vocab bins—exactly mirroring the dynamic-generation path
+    in ``MoleculeDataset``.
+    """
+
+    def __init__(
+        self,
+        vocab: MolScannerVocab,
+        csv_path: str,
+        data_dir: str,
+        image_size: Tuple[int, int] = (384, 384),
+        img_augment: bool = True,
+        geo_augment: bool = True,
+    ):
+        self.vocab = vocab
+        self.image_size = image_size
+        self.df = pd.read_csv(csv_path)
+
+        # Filter out rows whose SMILES contain characters outside the vocab
+        # (e.g. "*")
+        vocab_chars = set(self.vocab.token2idx.keys())
+        def _has_unk(smiles: str) -> bool:
+            return any(c not in vocab_chars for c in str(smiles))
+        def _has_annotation(smiles: str) -> bool:
+            return any(segment in ['[(]', '[)]']for segment in smiles.split('.'))
+        n_before = len(self.df)
+        self.df = self.df[~self.df['SMILES'].apply(_has_unk)&~self.df['SMILES'].apply(_has_annotation)].reset_index(drop=True)
+        n_filtered = n_before - len(self.df)
+        if n_filtered > 0:
+            print(f"[USPTOMolDataset] Filtered {n_filtered}/{n_before} rows "
+                  f"with non-vocab SMILES chars ({100*n_filtered/n_before:.1f}%)")
+
+        # Resolve image paths
+        if not os.path.isabs(self.df['file_path'].iloc[0]):
+            self.df['file_path'] = self.df['file_path'].apply(
+                lambda p: os.path.join(data_dir, p)
+            )
+
+        self.pad_to_square = PadToSquare(fill=255)
+
+        # Geometric augmentations (with keypoint tracking)
+        geo_list = []
+        if geo_augment:
+            geo_list += [
+                A.Affine(rotate=(-90, 90), fit_output=True, fill=255, p=0.5),
+                CropWhiteTrain(pad=5, p=1.0),
+                A.RandomCropFromBorders(
+                    crop_left=0.01, crop_right=0.01,
+                    crop_top=0.01, crop_bottom=0.01, p=0.5,
+                ),
+                A.CropAndPad(
+                    percent=(0.0, 0.4), sample_independently=True,
+                    keep_size=False, fill=255, fill_mask=255, p=0.2,
+                ),
+            ]
+        self.geo_transforms = A.Compose(
+            geo_list,
+            keypoint_params=A.KeypointParams(format='xy', remove_invisible=False),
+        )
+
+        # Image-level noise augmentation
+        img_list = []
+        if img_augment:
+            img_list += [
+                A.Downscale(scale_range=(0.5, 0.8),
+                            interpolation_pair={'upscale': 3, 'downscale': 3}),
+                A.Blur(),
+                A.GaussNoise(),
+                A.SaltAndPepper(),
+            ]
+        self.img_transforms = A.Compose(img_list)
+
+        # Final resize + normalise
+        self.post_transforms = A.Compose([
+            AdaptiveResize(height=image_size[0], width=image_size[1]),
+            A.ToGray(num_output_channels=3),
+            A.Normalize(),
+            ToTensorV2(),
+        ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+
+    def __len__(self) -> int:
+        return len(self.df)
+
+    # ------------------------------------------------------------------
+
+    def __getitem__(self, idx: int) -> Optional[Dict]:
+        row = self.df.iloc[idx]
+
+        # --- Load image ---
+        img = cv2.imread(row['file_path'])
+        if img is None:
+            return self._dummy()
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        h, w = img.shape[:2]
+
+        smiles = row['SMILES']
+        if not isinstance(smiles, str) or len(smiles.strip()) == 0:
+            return self._dummy()
+
+        # --- Parse node coordinates ---
+        try:
+            raw_coords = np.array(eval(row['node_coords']), dtype=np.float64)
+        except Exception:
+            return self._dummy()
+        if raw_coords.ndim != 2 or raw_coords.shape[1] != 2 or len(raw_coords) == 0:
+            return self._dummy()
+
+        # Normalise to [0,1] then scale to image pixel space
+        coords_norm = normalize_nodes(raw_coords)  # [0,1], y-flipped
+        pixel_coords = coords_norm.copy()
+        pixel_coords[:, 0] *= w
+        pixel_coords[:, 1] *= h
+        pixel_coords = pixel_coords.tolist()
+
+        # --- Parse edge list → N×N bond matrix ---
+        n_atoms = len(raw_coords)
+        bond_mat = np.zeros((n_atoms, n_atoms), dtype=int)
+        if 'edges' in self.df.columns:
+            try:
+                edge_list = eval(row['edges'])
+                for u, v, t in edge_list:
+                    if u < n_atoms and v < n_atoms:
+                        if t <= 4:
+                            bond_mat[u, v] = t
+                            bond_mat[v, u] = t
+                        else:
+                            bond_mat[u, v] = t
+                            bond_mat[v, u] = 11 - t
+            except Exception:
+                pass  # fall back to zero matrix
+
+        # --- Augment ---
+        geo_result = self.geo_transforms(image=img, keypoints=pixel_coords)
+        img = geo_result['image']
+        coords_px = geo_result['keypoints']
+
+        img, coords_px = self.pad_to_square(img, coords_px)
+        img = self.img_transforms(image=img)['image']
+
+        post_result = self.post_transforms(image=img, keypoints=coords_px)
+        img_tensor = post_result['image']
+        coords_px = post_result['keypoints']
+
+        # --- Quantise coordinates to bins ---
+        H, W = self.image_size
+        n_bins = self.vocab.n_bins
+        binned_coords = []
+        for coord in coords_px:
+            x = min(max(0, coord[0]), W - 1)
+            y = min(max(0, coord[1]), H - 1)
+            x_bin = max(0, min(n_bins - 1, int((x / W) * n_bins)))
+            y_bin = max(0, min(n_bins - 1, int((y / H) * n_bins)))
+            binned_coords.append([x_bin, y_bin])
+
+        # --- Tokenise ---
+        try:
+            tok_id_seq, atom_indices = self.vocab.smiles_to_sequence(smiles, binned_coords)
+        except Exception:
+            return self._dummy()
+
+        return {
+            'img': img_tensor,
+            'smiles': smiles,
+            'tok_id_seq': tok_id_seq,
+            'atom_indices': atom_indices,
+            'bond_mat': bond_mat,
+            'success': True,
+        }
+
+    # ------------------------------------------------------------------
+
+    def _dummy(self) -> Dict:
+        dummy = _blank_image()
+        dummy, _ = self.pad_to_square(dummy)
+        img_tensor = self.post_transforms(image=dummy, keypoints=[])['image']
+        return {
+            'img': img_tensor,
+            'smiles': '',
+            'tok_id_seq': [],
+            'atom_indices': [],
+            'bond_mat': np.zeros((1, 1), dtype=int),
+            'success': False,
+        }
+
+
 # ======================== Collate Function ========================
 
 def collate_fn(batch_list: List[Dict], vocab: MolScannerVocab, max_atoms_limit: int = 100, max_seq_len: int = 600) -> Optional[Dict]:
@@ -2661,9 +2877,13 @@ def evaluate_benchmarks(
 # ======================== DDP Training Loop ========================
 
 def train(
-        # data
-        smiles_list: List[str],
-        smiles_num: int,
+        *,
+        # data (SMILES-based dynamic generation)
+        smiles_list: Optional[List[str]] = None,
+        smiles_num: Optional[int] = None,
+        # data (file-based: USPTO mol CSV)
+        train_csv_path: Optional[str] = None,
+        train_data_dir: Optional[str] = None,
         # training 
         save_path: str,
         num_epochs: int,
@@ -2699,6 +2919,8 @@ def train(
         force_cpu: bool = False,
         # ===== resume from checkpoint =====
         resume_from: Optional[str] = None,
+        # ===== fine-tune from pretrained weights (model only, fresh optimizer) =====
+        finetune_from: Optional[str] = None,
 ) -> List[float]:
     """
     DDP training loop with cosine-annealed LR, AMP, and per-epoch validation.
@@ -2706,12 +2928,18 @@ def train(
     Launch with torchrun:
         torchrun --nproc_per_node=<N_GPUS> train_MolScanner_ddp.py
 
+    Supports two data modes:
+      1. SMILES-based (dynamic rendering): pass *smiles_list* + *smiles_num*
+      2. File-based (USPTO mol images):    pass *train_csv_path* + *train_data_dir*
+
     Args:
-        smiles_list: Full pool of training SMILES.
+        smiles_list: Pool of training SMILES (mode 1).
+        smiles_num: Number of SMILES to sample from *smiles_list* (mode 1).
+        train_csv_path: Path to CSV with file_path/SMILES/node_coords/edges (mode 2).
+        train_data_dir: Root directory for resolving image paths in CSV (mode 2).
         save_path: Directory for checkpoints and TensorBoard logs.
         benchmark_dir / benchmark_csv_path: Validation benchmark.
         batch_size: **Per-GPU** batch size (effective = batch_size × world_size).
-        smiles_num: Number of SMILES to sample from *smiles_list* for training.
         (remaining args are self-explanatory model / optimization hyper-parameters)
     """
     # ===== DDP setup =====
@@ -2755,27 +2983,44 @@ def train(
         print(f'Vocab size: {len(vocab)}')
     
     # Prepare training data
-    n = len(smiles_list)
-    rng = np.random.default_rng(seed)  # Same seed for all ranks -> same data selection
-    indices = np.arange(n)
-    rng.shuffle(indices)
-    indices = indices[:smiles_num]
-    train_smiles = [smiles_list[i] for i in indices]
-    
-    if is_main_process():
-        print(f'Train size: {len(train_smiles)}')
-        print(f'Benchmark validation: {benchmark_csv_path}')
-    
-    # Training dataset
-    train_dataset = MoleculeDataset(
-        smiles_list=train_smiles,
-        shuffle_smiles=True,
-        vocab=vocab,
-        image_size=image_size,
-        mol_augment=mol_augment,
-        geo_augment=True,
-        img_augment=True,
-    )
+    if train_csv_path is not None:
+        # --- File-based mode (USPTO mol data) ---
+        if is_main_process():
+            print(f'File-based data mode: {train_csv_path}')
+        train_dataset = USPTOMolDataset(
+            vocab=vocab,
+            csv_path=train_csv_path,
+            data_dir=train_data_dir or '',
+            image_size=image_size,
+            img_augment=True,
+            geo_augment=True,
+        )
+        if is_main_process():
+            print(f'Train size: {len(train_dataset)}')
+            print(f'Benchmark validation: {benchmark_csv_path}')
+    else:
+        # --- SMILES-based mode (dynamic rendering) ---
+        n = len(smiles_list)
+        rng = np.random.default_rng(seed)  # Same seed for all ranks -> same data selection
+        indices = np.arange(n)
+        rng.shuffle(indices)
+        indices = indices[:smiles_num]
+        train_smiles = [smiles_list[i] for i in indices]
+        
+        if is_main_process():
+            print(f'Train size: {len(train_smiles)}')
+            print(f'Benchmark validation: {benchmark_csv_path}')
+        
+        # Training dataset
+        train_dataset = MoleculeDataset(
+            smiles_list=train_smiles,
+            shuffle_smiles=True,
+            vocab=vocab,
+            image_size=image_size,
+            mol_augment=mol_augment,
+            geo_augment=True,
+            img_augment=True,
+        )
     
     # Get predefined bond class weights
     bond_class_weights = get_bond_class_weights()
@@ -2899,6 +3144,19 @@ def train(
             print(f'  best_val_acc={best_val_acc:.4f}, epochs_no_improve={epochs_no_improve}')
         del ckpt
         torch.cuda.empty_cache()
+    elif finetune_from is not None and os.path.isfile(finetune_from):
+        if is_main_process():
+            print(f'Fine-tuning from pretrained weights: {finetune_from}')
+        state_dict = torch.load(finetune_from, map_location=device, weights_only=True)
+        # Handle both full checkpoint and state_dict-only formats
+        if isinstance(state_dict, dict) and 'model_state_dict' in state_dict:
+            state_dict = state_dict['model_state_dict']
+        actual_model = model.module if hasattr(model, 'module') else model
+        actual_model.load_state_dict(state_dict)
+        del state_dict
+        torch.cuda.empty_cache()
+        if is_main_process():
+            print('  Optimizer/scheduler initialized fresh for fine-tuning')
     
     # Recompute global_step from start_epoch (avoids drift from interrupted runs)
     global_step = (start_epoch - 1) * steps_per_epoch
