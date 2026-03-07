@@ -48,7 +48,12 @@ if __name__ == '__main__':
     parser.add_argument('--reward_mode', type=str, default='visual',
                         choices=['visual', 'tanimoto', 'edit_distance'],
                         help='Reward similarity mode')
+    parser.add_argument('--gpu', type=str, default='0',
+                        help='Comma-separated GPU ids (default: "0")')
     args = parser.parse_args()
+
+    os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
     data_dir = project_dir / "data"
     log_dir = project_dir / "MolScanner" / "models" / "MolScribe_re_82K_MolParser" / args.reward_mode

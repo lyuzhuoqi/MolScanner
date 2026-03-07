@@ -35,7 +35,12 @@ if __name__ == '__main__':
     parser.add_argument('--stage1_checkpoint', type=str, default=None,
                         help='Path to Stage 1 model weights for fine-tuning '
                              '(default: models/MolScribe_re_1M_synthetic/best.pth)')
+    parser.add_argument('--gpu', type=str, default='0',
+                        help='Comma-separated GPU ids (default: "0")')
     args = parser.parse_args()
+
+    os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
     data_dir = project_dir / "data"
     log_dir = project_dir / "MolScanner" / "models" / "MolScribe_re_680K_USPTO"
