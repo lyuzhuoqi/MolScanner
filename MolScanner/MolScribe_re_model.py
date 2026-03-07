@@ -3174,6 +3174,46 @@ def train(
             log_dir = os.path.join(save_path, 'logs', timestamp)
             print(f'TensorBoard logs (new): {log_dir}')
         writer = SummaryWriter(log_dir=log_dir)
+
+        # ===== Save hyperparameters =====
+        import json
+        hparams = {
+            'batch_size': batch_size,
+            'effective_batch_size': batch_size * world_size,
+            'encoder_lr': encoder_lr,
+            'decoder_lr': decoder_lr,
+            'weight_decay': weight_decay,
+            'warmup_ratio': warmup_ratio,
+            'num_epochs': num_epochs,
+            'early_stopping_patience': early_stopping_patience,
+            'image_size': str(image_size),
+            'n_bins': n_bins,
+            'backbone': backbone,
+            'pretrained': pretrained,
+            'd_model': d_model,
+            'nhead': nhead,
+            'num_decoder_layers': num_decoder_layers,
+            'dim_feedforward': dim_feedforward,
+            'dropout': dropout,
+            'max_atoms': max_atoms,
+            'mol_augment': mol_augment,
+            'use_amp': use_amp,
+            'use_gradient_checkpointing': use_gradient_checkpointing,
+            'seed': seed,
+            'train_csv_path': train_csv_path,
+            'train_data_dir': train_data_dir,
+            'smiles_num': smiles_num,
+            'train_samples': len(train_dataset),
+            'resume_from': resume_from,
+            'finetune_from': finetune_from,
+        }
+        hparams_path = os.path.join(log_dir, 'hparams.json')
+        with open(hparams_path, 'w') as f:
+            json.dump(hparams, f, indent=2)
+        hparams_md = '| Param | Value |\n|---|---|\n'
+        for k, v in hparams.items():
+            hparams_md += f'| {k} | {v} |\n'
+        writer.add_text('Hyperparameters', hparams_md, global_step=0)
     else:
         log_dir = None
     
