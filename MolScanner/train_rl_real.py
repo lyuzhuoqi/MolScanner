@@ -55,7 +55,7 @@ if __name__ == '__main__':
     if args.pretrained:
         pretrained_path = args.pretrained
     else:
-        pretrained_path = str(molscanner_dir / "models" / "MolScribe_re"
+        pretrained_path = str(molscanner_dir / "models" / "MolScribe_re_1M_synthetic"
                               / "best.pth")
 
     # Training data: MolParser-7M sft_real (~91K)
