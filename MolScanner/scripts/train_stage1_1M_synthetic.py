@@ -14,6 +14,7 @@ Usage:
     torchrun --nproc_per_node=4 scripts/train_stage1_1M_synthetic.py --resume
 """
 import sys
+import os
 from pathlib import Path
 import pickle
 import argparse
@@ -30,7 +31,12 @@ if __name__ == '__main__':
                         help='Resume training from checkpoint_resume.pth')
     parser.add_argument('--resume_from', type=str, default=None,
                         help='Path to a specific checkpoint file to resume from')
+    parser.add_argument('--gpu', type=str, default='0',
+                        help='Comma-separated GPU ids (default: "0")')
     args = parser.parse_args()
+
+    os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
     data_dir = project_dir / "data"
     log_dir = project_dir / "MolScanner" / "models" / "MolScribe_re_1M_synthetic"
