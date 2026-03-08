@@ -22,7 +22,7 @@ Launch training with ``torchrun``:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -2878,12 +2878,12 @@ def evaluate_benchmarks(
 
 def train(
         *,
-        # data (SMILES-based dynamic generation)
-        smiles_list: Optional[List[str]] = None,
-        smiles_num: Optional[int] = None,
-        # data (file-based: USPTO mol CSV)
-        train_csv_path: Optional[str] = None,
-        train_data_dir: Optional[str] = None,
+        # data (PubChem SMILES — dynamically rendered synthetic images)
+        pubchem_smiles_list: Optional[List[str]] = None,
+        pubchem_smiles_num: Optional[int] = None,
+        # data (USPTO patent molecule images — real-world file-based)
+        uspto_csv_path: Optional[str] = None,
+        uspto_data_dir: Optional[str] = None,
         # training 
         save_path: str,
         num_epochs: int,
@@ -2928,15 +2928,16 @@ def train(
     Launch with torchrun:
         torchrun --nproc_per_node=<N_GPUS> train_MolScanner_ddp.py
 
-    Supports two data modes:
-      1. SMILES-based (dynamic rendering): pass *smiles_list* + *smiles_num*
-      2. File-based (USPTO mol images):    pass *train_csv_path* + *train_data_dir*
+    Supports three data configurations:
+      1. PubChem synthetic only:  pass *pubchem_smiles_list* + *pubchem_smiles_num*
+      2. USPTO only:              pass *uspto_csv_path* + *uspto_data_dir*
+      3. Joint (recommended):     pass both PubChem and USPTO args
 
     Args:
-        smiles_list: Pool of training SMILES (mode 1).
-        smiles_num: Number of SMILES to sample from *smiles_list* (mode 1).
-        train_csv_path: Path to CSV with file_path/SMILES/node_coords/edges (mode 2).
-        train_data_dir: Root directory for resolving image paths in CSV (mode 2).
+        pubchem_smiles_list: Pool of PubChem SMILES for synthetic rendering.
+        pubchem_smiles_num: Number of SMILES to sample from the pool.
+        uspto_csv_path: Path to USPTO CSV with file_path/SMILES/node_coords/edges.
+        uspto_data_dir: Root directory for resolving image paths in USPTO CSV.
         save_path: Directory for checkpoints and TensorBoard logs.
         benchmark_dir / benchmark_csv_path: Validation benchmark.
         batch_size: **Per-GPU** batch size (effective = batch_size × world_size).
@@ -2983,37 +2984,40 @@ def train(
         print(f'Vocab size: {len(vocab)}')
     
     # Prepare training data
-    if train_csv_path is not None:
-        # --- File-based mode (USPTO mol data) ---
+    has_pubchem = pubchem_smiles_list is not None
+    has_uspto = uspto_csv_path is not None
+    if not has_pubchem and not has_uspto:
+        raise ValueError('Must provide pubchem_smiles_list and/or uspto_csv_path')
+
+    datasets = []  # list of (name, dataset) tuples
+
+    if has_uspto:
         if is_main_process():
-            print(f'File-based data mode: {train_csv_path}')
-        train_dataset = USPTOMolDataset(
+            print(f'USPTO data: {uspto_csv_path}')
+        uspto_dataset = USPTOMolDataset(
             vocab=vocab,
-            csv_path=train_csv_path,
-            data_dir=train_data_dir or '',
+            csv_path=uspto_csv_path,
+            data_dir=uspto_data_dir or '',
             image_size=image_size,
             img_augment=True,
             geo_augment=True,
         )
+        datasets.append(('USPTO', uspto_dataset))
         if is_main_process():
-            print(f'Train size: {len(train_dataset)}')
-            print(f'Benchmark validation: {benchmark_csv_path}')
-    else:
-        # --- SMILES-based mode (dynamic rendering) ---
-        n = len(smiles_list)
+            print(f'USPTO dataset size: {len(uspto_dataset)}')
+
+    if has_pubchem:
+        n = len(pubchem_smiles_list)
         rng = np.random.default_rng(seed)  # Same seed for all ranks -> same data selection
         indices = np.arange(n)
         rng.shuffle(indices)
-        indices = indices[:smiles_num]
-        train_smiles = [smiles_list[i] for i in indices]
-        
+        if pubchem_smiles_num is not None:
+            indices = indices[:pubchem_smiles_num]
+        sampled_smiles = [pubchem_smiles_list[i] for i in indices]
         if is_main_process():
-            print(f'Train size: {len(train_smiles)}')
-            print(f'Benchmark validation: {benchmark_csv_path}')
-        
-        # Training dataset
-        train_dataset = MoleculeDataset(
-            smiles_list=train_smiles,
+            print(f'PubChem synthetic data: {len(sampled_smiles)} SMILES')
+        pubchem_dataset = MoleculeDataset(
+            smiles_list=sampled_smiles,
             shuffle_smiles=True,
             vocab=vocab,
             image_size=image_size,
@@ -3021,6 +3025,20 @@ def train(
             geo_augment=True,
             img_augment=True,
         )
+        datasets.append(('PubChem', pubchem_dataset))
+
+    if len(datasets) > 1:
+        train_dataset = ConcatDataset([d for _, d in datasets])
+        if is_main_process():
+            parts = ' + '.join(f'{name}: {len(d)}' for name, d in datasets)
+            print(f'Joint training dataset: {len(train_dataset)} ({parts})')
+    else:
+        train_dataset = datasets[0][1]
+        if is_main_process():
+            print(f'Train size: {len(train_dataset)} ({datasets[0][0]} only)')
+
+    if is_main_process():
+        print(f'Benchmark validation: {benchmark_csv_path}')
     
     # Get predefined bond class weights
     bond_class_weights = get_bond_class_weights()
@@ -3200,9 +3218,9 @@ def train(
             'use_amp': use_amp,
             'use_gradient_checkpointing': use_gradient_checkpointing,
             'seed': seed,
-            'train_csv_path': train_csv_path,
-            'train_data_dir': train_data_dir,
-            'smiles_num': smiles_num,
+            'uspto_csv_path': uspto_csv_path,
+            'uspto_data_dir': uspto_data_dir,
+            'pubchem_smiles_num': pubchem_smiles_num,
             'train_samples': len(train_dataset),
             'resume_from': resume_from,
             'finetune_from': finetune_from,

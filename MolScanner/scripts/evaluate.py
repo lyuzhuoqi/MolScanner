@@ -5,11 +5,14 @@ Unified Evaluation for MolScribe_re
 Evaluate any training stage on all benchmarks with configurable checkpoint.
 
 Usage:
-    python scripts/evaluate.py --stage stage1_1M_synthetic
-    python scripts/evaluate.py --stage stage2_1M680K_USPTO
-    python scripts/evaluate.py --stage stage2_1M680K_USPTO --checkpoint epoch_10
-    python scripts/evaluate.py --checkpoint_path /path/to/model.pth --stage custom_run
-    python scripts/evaluate.py --stage stage1_1M_synthetic --gpu 0,1
+    python scripts/evaluate.py --stage stage1_1M680K
+    python scripts/evaluate.py --stage stage1_1M680K --checkpoint epoch_10
+    python scripts/evaluate.py --stage stage1_synthetic
+    python scripts/evaluate.py --stage stage1_uspto
+    python scripts/evaluate.py --stage stage2_82K_MolParser --reward_mode visual
+    python scripts/evaluate.py --stage stage2_82K_MolParser --reward_mode tanimoto
+    python scripts/evaluate.py --checkpoint_path /path/to/model.pth --stage stage1_1M680K
+    python scripts/evaluate.py --stage stage1_1M680K --gpu 0,1
 """
 import sys
 import json
@@ -25,17 +28,21 @@ from MolScribe_re_model import MolScannerVocab, MolScribeModel, evaluate_benchma
 
 # ===== Stage configurations =====
 STAGES = {
-    'stage1_1M_synthetic': {
+    'stage1_1M680K': {
+        'model_dir': 'MolScribe_re_1M680K',
+        'description': 'Stage 1: 1M PubChem + 680K USPTO joint training',
+    },
+    'stage1_synthetic': {
         'model_dir': 'MolScribe_re_1M_synthetic',
-        'description': 'Stage 1: 1M PubChem synthetic pre-training',
+        'description': 'Stage 1 (synthetic only): 1M PubChem synthetic',
     },
-    'stage2_680K_USPTO': {
+    'stage1_uspto': {
         'model_dir': 'MolScribe_re_680K_USPTO',
-        'description': 'Stage 2: 680K USPTO molfile pre-training',
+        'description': 'Stage 1 (USPTO only): 680K USPTO molfile',
     },
-    'stage3_82K_MolParser': {
+    'stage2_82K_MolParser': {
         'model_dir': 'MolScribe_re_82K_MolParser',
-        'description': 'Stage 3: 82K MolParser RL-based fine-tuning',
+        'description': 'Stage 2: 82K MolParser RL-based fine-tuning',
     }
 }
 
@@ -51,6 +58,9 @@ def main():
                         help='Override: explicit path to checkpoint file')
     parser.add_argument('--gpu', type=str, default='0',
                         help='Comma-separated GPU ids (default: "0")')
+    parser.add_argument('--reward_mode', type=str, default='visual',
+                        choices=['visual', 'tanimoto', 'edit_distance'],
+                        help='Reward mode for Stage 2 checkpoint selection (default: visual)')
     parser.add_argument('--beam_size', type=int, default=1,
                         help='Beam size for inference (default: 1)')
     args = parser.parse_args()
@@ -62,12 +72,17 @@ def main():
     data_dir = project_dir / "data"
     stage_cfg = STAGES[args.stage]
 
+    # Stage 2 checkpoints are saved under a reward_mode subdirectory
+    model_dir = Path(stage_cfg['model_dir'])
+    if args.stage == 'stage2_82K_MolParser':
+        model_dir = model_dir / args.reward_mode
+
     # ===== Resolve checkpoint path =====
     if args.checkpoint_path:
         ckpt_path = args.checkpoint_path
     else:
         ckpt_path = str(
-            project_dir / "MolScanner" / "models" / stage_cfg['model_dir'] / f"{args.checkpoint}.pth"
+            project_dir / "MolScanner" / "models" / model_dir / f"{args.checkpoint}.pth"
         )
 
     print("=" * 60)
@@ -105,7 +120,7 @@ def main():
                 bstats[k] = v.to_dict(orient='records')
 
     # ===== Save results =====
-    results_dir = project_dir / "MolScanner" / "results" / stage_cfg['model_dir']
+    results_dir = project_dir / "MolScanner" / "results" / model_dir
     results_dir.mkdir(parents=True, exist_ok=True)
     output_file = results_dir / f"{args.checkpoint}_evaluation_results.json"
 
