@@ -8,7 +8,6 @@ Usage:
     python scripts/evaluate.py --stage stage1_1M680K
     python scripts/evaluate.py --stage stage1_1M680K --checkpoint epoch_10
     python scripts/evaluate.py --stage stage1_synthetic
-    python scripts/evaluate.py --stage stage1_uspto
     python scripts/evaluate.py --stage stage2_82K_MolParser --reward_mode visual
     python scripts/evaluate.py --stage stage2_82K_MolParser --reward_mode tanimoto
     python scripts/evaluate.py --checkpoint_path /path/to/model.pth --stage stage1_1M680K
@@ -35,10 +34,6 @@ STAGES = {
     'stage1_synthetic': {
         'model_dir': 'MolScribe_re_1M_synthetic',
         'description': 'Stage 1 (synthetic only): 1M PubChem synthetic',
-    },
-    'stage1_uspto': {
-        'model_dir': 'MolScribe_re_680K_USPTO',
-        'description': 'Stage 1 (USPTO only): 680K USPTO molfile',
     },
     'stage2_82K_MolParser': {
         'model_dir': 'MolScribe_re_82K_MolParser',
@@ -105,10 +100,13 @@ def main():
         {'name': 'indigo',   'benchmark_dir': str(data_dir / "benchmark/synthetic/indigo"),   'csv_path': str(data_dir / "benchmark/synthetic/indigo.csv")},
         {'name': 'chemdraw', 'benchmark_dir': str(data_dir / "benchmark/synthetic/chemdraw"), 'csv_path': str(data_dir / "benchmark/synthetic/chemdraw.csv")},
         {'name': 'CLEF',     'benchmark_dir': str(data_dir / "benchmark/real/CLEF"),          'csv_path': str(data_dir / "benchmark/real/CLEF.csv")},
+        {'name': 'JPO',      'benchmark_dir': str(data_dir / "benchmark/real/JPO"),           'csv_path': str(data_dir / "benchmark/real/JPO.csv")},
         {'name': 'UOB',      'benchmark_dir': str(data_dir / "benchmark/real/UOB"),           'csv_path': str(data_dir / "benchmark/real/UOB.csv")},
         {'name': 'USPTO',    'benchmark_dir': str(data_dir / "benchmark/real/USPTO"),         'csv_path': str(data_dir / "benchmark/real/USPTO.csv")},
+        {'name': 'USPTO-10K',  'benchmark_dir': str(data_dir / "benchmark/real/USPTO-10K"),  'csv_path': str(data_dir / "benchmark/real/USPTO-10K.csv")},
         {'name': 'staker',   'benchmark_dir': str(data_dir / "benchmark/real/staker"),        'csv_path': str(data_dir / "benchmark/real/staker.csv")},
         {'name': 'acs',      'benchmark_dir': str(data_dir / "benchmark/real/acs"),           'csv_path': str(data_dir / "benchmark/real/acs.csv")},
+        {'name': 'WildMol-10K', 'benchmark_dir': str(data_dir / "benchmark/real/WildMol-10K"), 'csv_path': str(data_dir / "benchmark/real/WildMol-10K.csv")},
     ]
 
     results = evaluate_benchmarks(model, benchmarks, beam_size=args.beam_size)
