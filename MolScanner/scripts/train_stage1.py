@@ -65,6 +65,10 @@ if __name__ == '__main__':
                         help='Path to a specific checkpoint file to resume from')
     parser.add_argument('--gpu', type=str, default='0',
                         help='Comma-separated GPU ids (default: "0")')
+    parser.add_argument('--val_benchmarks', type=str, nargs='+',
+                        default=['USPTO', 'JPO'],
+                        help='Validation benchmark names (default: USPTO JPO). '
+                             'First one is primary for early stopping.')
     args = parser.parse_args()
 
     os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
@@ -140,6 +144,17 @@ if __name__ == '__main__':
             uspto_data_dir=str(data_dir),
         )
 
+    # ===== Build validation benchmark list =====
+    real_dir = data_dir / "benchmark" / "real"
+    val_benchmarks = []
+    for bm_name in args.val_benchmarks:
+        bm_dir = real_dir / bm_name
+        bm_csv = real_dir / f"{bm_name}.csv"
+        if not bm_csv.exists():
+            print(f"WARNING: benchmark CSV not found: {bm_csv}, skipping")
+            continue
+        val_benchmarks.append({'name': bm_name, 'dir': str(bm_dir), 'csv': str(bm_csv)})
+
     print(f"Data mode: {args.data_mode}")
     print(f"Save path: {log_dir}")
 
@@ -164,9 +179,8 @@ if __name__ == '__main__':
         mol_augment=True,
         max_atoms=100,
 
-        # validation (real-world benchmark)
-        benchmark_dir=str(data_dir / "benchmark" / "real" / "USPTO"),
-        benchmark_csv_path=str(data_dir / "benchmark" / "real" / "USPTO.csv"),
+        # validation (real-world benchmarks)
+        benchmarks=val_benchmarks,
         val_max_samples=50 if FAST_TEST else None,
 
         # vision transformer

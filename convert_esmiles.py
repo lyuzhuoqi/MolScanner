@@ -32,7 +32,7 @@ Conversion rules:
     6. Anything else: try condensed-formula expansion via get_smiles_from_symbol;
        on failure the atom falls back to bare * (graceful degradation).
   Subscript brackets (R[1]→R1, CH[2]→CH2) and primes (R'→R) are normalised.
-  Final SMILES is canonicalized with ignore_cistrans=True (matching training)
+  Final SMILES is canonicalized with ignore_cistrans=False (while it will be ignored during evaluation for consistency)
   and validated with full RDKit sanitization.
 
 Usage:

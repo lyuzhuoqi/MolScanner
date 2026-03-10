@@ -44,6 +44,7 @@ import os
 from functools import partial
 from func_timeout import FunctionTimedOut
 import math
+import re
 import warnings
 from tqdm import tqdm
 from datetime import datetime, timedelta
@@ -61,7 +62,13 @@ if hasattr(torch, 'set_float32_matmul_precision'):
 cv2.setNumThreads(0)
 cv2.ocl.setUseOpenCL(False)
 
-from drawing_engine import generate_image_from_smiles, _blank_image
+import drawing_engine as _drawing_engine  # module-level for autoreload compatibility with @func_set_timeout
+
+def generate_image_from_smiles(*args, **kwargs):
+    return _drawing_engine.generate_image_from_smiles(*args, **kwargs)
+
+def _blank_image(*args, **kwargs):
+    return _drawing_engine._blank_image(*args, **kwargs)
 from chemistry import (
     _convert_graph_to_smiles, _verify_chirality, canonicalize_smiles,
     _replace_functional_group, _expand_functional_group,
@@ -84,14 +91,14 @@ def setup_ddp(rank: int, world_size: int):
     Timeout budget (defence-in-depth):
       Layer 1: func_set_timeout(5s) in drawing_engine  – catches most hangs
       Layer 2: DataLoader timeout=60s                  – kills hung C-extension workers
-      Layer 3: NCCL collective timeout=5 min           – fast crash if recovery fails
+      Layer 3: NCCL collective timeout=30 min          – generous for validation inference variance
       Layer 4: NCCL heartbeat env var=1800s            – prevents watchdog kills during recovery
     """
     # Prevent NCCL watchdog from killing processes while DataLoader is recovering
     os.environ.setdefault("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", "1800")
     dist.init_process_group(
         "nccl", rank=rank, world_size=world_size,
-        timeout=timedelta(minutes=5),
+        timeout=timedelta(minutes=30),
     )
     torch.cuda.set_device(rank)
 
@@ -388,6 +395,90 @@ class MolScannerVocab:
             mask[self.sos_idx] = True
         return mask
 
+# ======================== Scan Edge Lines Augmentation ========================
+
+class ScanEdgeLines(A.ImageOnlyTransform):
+    """Simulate dark lines / shadows at page edges from document scanning.
+
+    When a book or patent page is scanned, the scanner bed often captures
+    dark bands near the binding edge or page borders.  This augmentation
+    draws 1-3 such lines on random edges of the image to make the model
+    robust to this common artefact in real patent images.
+
+    Each line is a semi-transparent dark band whose width, intensity, and
+    edge are randomised independently.
+    """
+
+    def __init__(self, max_lines: int = 3, p: float = 0.3):
+        super().__init__(p=p)
+        self.max_lines = max_lines
+
+    def apply(self, img, **params):
+        h, w = img.shape[:2]
+        n_lines = random.randint(1, self.max_lines)
+        result = img.copy()
+
+        edges = random.sample(['top', 'bottom', 'left', 'right'], k=min(n_lines, 4))
+
+        for edge in edges:
+            # Band width: 1-6 % of the relevant dimension
+            if edge in ('top', 'bottom'):
+                band_w = random.randint(max(1, int(h * 0.01)), max(2, int(h * 0.06)))
+            else:
+                band_w = random.randint(max(1, int(w * 0.01)), max(2, int(w * 0.06)))
+
+            # Darkness: 0 (black) – 80 (dark grey)
+            intensity = random.randint(0, 80)
+            # Alpha blend factor for the band
+            alpha = random.uniform(0.3, 1.0)
+
+            # Build the band region slice
+            if edge == 'top':
+                roi = result[0:band_w, :]
+            elif edge == 'bottom':
+                roi = result[h - band_w:h, :]
+            elif edge == 'left':
+                roi = result[:, 0:band_w]
+            else:  # right
+                roi = result[:, w - band_w:w]
+
+            # Blend: roi = roi * (1-alpha) + intensity * alpha
+            band = np.full_like(roi, intensity, dtype=np.uint8)
+            blended = cv2.addWeighted(roi, 1.0 - alpha, band, alpha, 0)
+            # Apply a gradient fade so the edge isn't perfectly sharp
+            if edge in ('top', 'bottom'):
+                grad = np.linspace(1.0, 0.0, band_w).reshape(-1, 1)
+                if edge == 'bottom':
+                    grad = grad[::-1]
+                if roi.ndim == 3:
+                    grad = grad[:, :, np.newaxis]
+            else:
+                grad = np.linspace(1.0, 0.0, band_w).reshape(1, -1)
+                if edge == 'right':
+                    grad = grad[:, ::-1]
+                if roi.ndim == 3:
+                    grad = grad[:, :, np.newaxis]
+            grad = grad.astype(np.float32)
+            # Where grad~1 use blended (dark), where grad~0 keep original
+            final = (blended.astype(np.float32) * grad
+                     + roi.astype(np.float32) * (1.0 - grad))
+            final = np.clip(final, 0, 255).astype(np.uint8)
+
+            if edge == 'top':
+                result[0:band_w, :] = final
+            elif edge == 'bottom':
+                result[h - band_w:h, :] = final
+            elif edge == 'left':
+                result[:, 0:band_w] = final
+            else:
+                result[:, w - band_w:w] = final
+
+        return result
+
+    def get_transform_init_args_names(self):
+        return ('max_lines',)
+
+
 # ======================== CropWhite for Training ========================
 
 class CropWhiteTrain(A.DualTransform):
@@ -567,7 +658,8 @@ class MoleculeDataset(Dataset):
                 A.Downscale(scale_range=(0.5, 0.8), interpolation_pair={'upscale': 3, 'downscale': 3}),
                 A.Blur(),
                 A.GaussNoise(),
-                A.SaltAndPepper()
+                A.SaltAndPepper(),
+                ScanEdgeLines(max_lines=3, p=0.3),
             ]
         self.img_transforms = A.Compose(self.img_transforms_list)
         # 3. Final transforms (after padding, no keypoints needed)
@@ -716,17 +808,35 @@ class USPTOMolDataset(Dataset):
         self.image_size = image_size
         self.df = pd.read_csv(csv_path)
 
-        # Filter out rows whose SMILES contain characters outside the vocab
-        # (e.g. "*")
+        # Normalise R-group representations to match synthetic data:
+        #   [N*] → [RN]  (e.g. [1*] → [R1], [69*] → [R69])
+        #   bare * → [R]
+        # This eliminates the label conflict where the same visual element
+        # (e.g. "R1" in the image) has different SMILES in synthetic vs USPTO.
+        def _normalise_rgroup(smiles: str) -> str:
+            if not isinstance(smiles, str):
+                return smiles
+            # [N*] → [RN]  (numbered wildcard → named R-group)
+            smiles = re.sub(r'\[(\d+)\*\]', r'[R\1]', smiles)
+            # bare * → [R]  (unnumbered wildcard → generic R-group)
+            smiles = re.sub(r'(?<!\[)\*', '[R]', smiles)
+            return smiles
+
+        self.df['SMILES'] = self.df['SMILES'].apply(_normalise_rgroup)
+        if is_main_process():
+            n_converted = (self.df['SMILES'] != pd.read_csv(csv_path)['SMILES']).sum()
+            if n_converted > 0:
+                print(f"[USPTOMolDataset] Normalised R-group notation in "
+                      f"{n_converted}/{len(self.df)} rows")
+
+        # Filter out rows whose SMILES still contain characters outside the vocab
         vocab_chars = set(self.vocab.token2idx.keys())
         def _has_unk(smiles: str) -> bool:
             return any(c not in vocab_chars for c in str(smiles))
-        def _has_annotation(smiles: str) -> bool:
-            return any(segment in ['[(]', '[)]']for segment in smiles.split('.'))
         n_before = len(self.df)
-        self.df = self.df[~self.df['SMILES'].apply(_has_unk)&~self.df['SMILES'].apply(_has_annotation)].reset_index(drop=True)
+        self.df = self.df[~self.df['SMILES'].apply(_has_unk)].reset_index(drop=True)
         n_filtered = n_before - len(self.df)
-        if n_filtered > 0:
+        if n_filtered > 0 and is_main_process():
             print(f"[USPTOMolDataset] Filtered {n_filtered}/{n_before} rows "
                   f"with non-vocab SMILES chars ({100*n_filtered/n_before:.1f}%)")
 
@@ -767,6 +877,7 @@ class USPTOMolDataset(Dataset):
                 A.Blur(),
                 A.GaussNoise(),
                 A.SaltAndPepper(),
+                ScanEdgeLines(max_lines=3, p=0.3),
             ]
         self.img_transforms = A.Compose(img_list)
 
@@ -1974,42 +2085,46 @@ class MolScribeModel(nn.Module):
         }
 
     def _greedy_decode_batch(self, feats: torch.Tensor, max_len: int, device: torch.device) -> List[List[int]]:
-        """Batched greedy decoding for multiple images simultaneously.
-        
-        Instead of B separate decode loops (each with batch=1), runs ONE decoder
-        forward pass per step with batch=B.  ~10-30x faster on GPU.
+        """Batched greedy decoding with KV-cached Transformer steps.
+
+        Uses :meth:`SequenceDecoder.forward_step_cached` so that each step
+        only processes the **new token** (O(T) per step, O(T²) total) instead
+        of re-encoding the full growing sequence (O(T²) per step, O(T³) total).
         """
         B = feats.size(0)
         vocab = self.vocab
-        
-        # All sequences start with SOS
-        seqs = torch.full((B, 1), vocab.sos_idx, dtype=torch.long, device=device)
+
+        # Pre-flatten encoder features → memory [B, S, d_model]
+        memory = feats.flatten(2).permute(0, 2, 1)
+
+        tokens = torch.full((B,), vocab.sos_idx, dtype=torch.long, device=device)
+        seqs = tokens.unsqueeze(1)  # [B, 1]
         finished = torch.zeros(B, dtype=torch.bool, device=device)
-        
-        for _ in range(max_len):
+        cache = None
+
+        for step in range(max_len):
             if finished.all():
                 break
-            
-            # Single forward pass for ALL sequences in the batch
-            logits = self.predict_step(feats, seqs)  # [B, vocab_size]
-            
-            # Apply per-sequence constraints (cheap CPU ops, negligible vs decoder)
+
+            logits, cache = self.sequence_decoder.forward_step_cached(
+                memory, tokens, step, cache
+            )  # logits: [B, vocab_size]
+
+            # Apply per-sequence constraints (cheap CPU ops)
             for b in range(B):
                 if not finished[b]:
                     logits[b] = self._apply_constraints(logits[b], seqs[b, -1].item())
-            
-            next_tokens = torch.argmax(logits, dim=-1)  # [B]
-            
-            # For already-finished sequences, emit PAD so they don't affect stats
-            next_tokens = torch.where(finished,
-                                      torch.full_like(next_tokens, vocab.pad_idx),
-                                      next_tokens)
-            
-            # Mark newly finished
-            finished = finished | (next_tokens == vocab.eos_idx)
-            
-            seqs = torch.cat([seqs, next_tokens.unsqueeze(1)], dim=1)
-        
+
+            tokens = torch.argmax(logits, dim=-1)  # [B]
+
+            # For already-finished sequences, emit PAD
+            tokens = torch.where(finished,
+                                 torch.full_like(tokens, vocab.pad_idx),
+                                 tokens)
+
+            finished = finished | (tokens == vocab.eos_idx)
+            seqs = torch.cat([seqs, tokens.unsqueeze(1)], dim=1)
+
         # Convert to list-of-lists, trimming after EOS / removing trailing PAD
         result = []
         pad, eos = vocab.pad_idx, vocab.eos_idx
@@ -2020,7 +2135,7 @@ class MolScribeModel(nn.Module):
             while seq and seq[-1] == pad:
                 seq.pop()
             result.append(seq)
-        
+
         return result
 
     def _sample_decode_batch(
@@ -2630,6 +2745,7 @@ def validate(
     beam_size: int = 1,
     max_samples: Optional[int] = None,
     val_batch_size: int = 128,
+    benchmark_name: str = '',
 ) -> Dict[str, float]:
     """Evaluate on benchmark using ALL DDP ranks; metrics aggregated via all_reduce.
 
@@ -2655,8 +2771,9 @@ def validate(
     # For DDP training val, skip entries with bad GT to keep things clean
     gt_data = [d for d in gt_data if d['gt_ok']]
 
+    tag = benchmark_name or os.path.splitext(os.path.basename(benchmark_csv_path))[0]
     if is_main_process():
-        print(f'\nEvaluating on {benchmark_csv_path} ({len(gt_data)} valid, {world_size} GPUs)')
+        print(f'\nEvaluating on {tag} ({len(gt_data)} valid, {world_size} GPUs)')
     if not gt_data:
         return {'exact_match_acc': 0.0, 'avg_tanimoto': 0.0, 'valid_samples': 0, 'failed_predictions': 0}
 
@@ -2681,7 +2798,7 @@ def validate(
 
     with torch.no_grad():
         n_batches = len(val_loader)
-        it = (tqdm(val_loader, total=n_batches, desc=f'Epoch {epoch} [Val R{rank}]')
+        it = (tqdm(val_loader, total=n_batches, desc=f'Epoch {epoch} [Val-{tag} R{rank}]')
               if is_main_process() else val_loader)
 
         for img_batch, indices in it:
@@ -2726,7 +2843,7 @@ def validate(
     results_out = {}
 
     if is_main_process():
-        print(f'Epoch {epoch} [Val] ({total_count} samples):')
+        print(f'Epoch {epoch} [Val-{tag}] ({total_count} samples):')
 
     for i, mode in enumerate(modes):
         exact = int(stats[1 + i * 3])
@@ -2743,9 +2860,9 @@ def validate(
             print(f'  [{mode:11s}] Exact={acc:.4f} ({exact}/{total_count})  '
                   f'Tanimoto={avg_tan:.4f}  Failed={failed}')
             if writer:
-                writer.add_scalar(f'Val/{mode}_exact_match_acc', acc, global_step)
-                writer.add_scalar(f'Val/{mode}_avg_tanimoto', avg_tan, global_step)
-                writer.add_scalar(f'Val/{mode}_failed', failed, global_step)
+                writer.add_scalar(f'Val_{tag}/{mode}_exact_match_acc', acc, global_step)
+                writer.add_scalar(f'Val_{tag}/{mode}_avg_tanimoto', avg_tan, global_step)
+                writer.add_scalar(f'Val_{tag}/{mode}_failed', failed, global_step)
 
     # Also store default (postprocess) under canonical keys for backward compat
     results_out['exact_match_acc'] = results_out.get(f'{SMILES_MODE_POSTPROCESS}/exact_match_acc', 0.0)
@@ -2894,10 +3011,12 @@ def train(
         warmup_ratio: float,
         seed: int,
         early_stopping_patience: int,
-        # Validation
-        benchmark_dir: str,
-        benchmark_csv_path: str,
+        # Validation (list of benchmarks; first one is primary for early stopping)
+        benchmarks: Optional[List[Dict[str, str]]] = None,
         val_max_samples: Optional[int] = None,
+        # Legacy single-benchmark args (used if benchmarks is None)
+        benchmark_dir: str = '',
+        benchmark_csv_path: str = '',
         # Molecule
         max_atoms: int = 100,
         mol_augment: bool = True,
@@ -2939,7 +3058,8 @@ def train(
         uspto_csv_path: Path to USPTO CSV with file_path/SMILES/node_coords/edges.
         uspto_data_dir: Root directory for resolving image paths in USPTO CSV.
         save_path: Directory for checkpoints and TensorBoard logs.
-        benchmark_dir / benchmark_csv_path: Validation benchmark.
+        benchmark_dir / benchmark_csv_path: Validation benchmark (legacy single).
+        benchmarks: List of dicts with keys 'name', 'dir', 'csv'. First is primary.
         batch_size: **Per-GPU** batch size (effective = batch_size × world_size).
         (remaining args are self-explanatory model / optimization hyper-parameters)
     """
@@ -2977,6 +3097,18 @@ def train(
     torch.manual_seed(seed)
     np.random.seed(seed + local_rank)  # Different augmentation per GPU
     random.seed(seed + local_rank)
+
+    # ===== Normalize benchmark list =====
+    if benchmarks is None:
+        if benchmark_dir and benchmark_csv_path:
+            benchmarks = [{'name': os.path.splitext(os.path.basename(benchmark_csv_path))[0],
+                           'dir': benchmark_dir, 'csv': benchmark_csv_path}]
+        else:
+            benchmarks = []
+    if is_main_process() and benchmarks:
+        print(f'Validation benchmarks ({len(benchmarks)}):')
+        for bm in benchmarks:
+            print(f'  {bm["name"]}: {bm["csv"]}')
     
     # Create vocab
     vocab = MolScannerVocab(n_bins=n_bins)
@@ -3400,20 +3532,25 @@ def train(
             print(f'Epoch {epoch} [Train] - avg_loss: {avg_loss:.4f}')
         
         # ===== Evaluation (all ranks participate, metrics aggregated via all_reduce) =====
-        val_metrics = validate(
-            model=model,
-            benchmark_dir=benchmark_dir,
-            benchmark_csv_path=benchmark_csv_path,
-            device=device,
-            epoch=epoch,
-            writer=writer,
-            global_step=global_step,
-            beam_size=1,
-            max_samples=val_max_samples
-        )
+        primary_val_metrics = None
+        for bm_idx, bm in enumerate(benchmarks):
+            val_metrics = validate(
+                model=model,
+                benchmark_dir=bm['dir'],
+                benchmark_csv_path=bm['csv'],
+                device=device,
+                epoch=epoch,
+                writer=writer,
+                global_step=global_step,
+                beam_size=1,
+                max_samples=val_max_samples,
+                benchmark_name=bm['name'],
+            )
+            if bm_idx == 0:
+                primary_val_metrics = val_metrics
 
         if is_main_process():
-            val_acc = val_metrics['exact_match_acc']
+            val_acc = primary_val_metrics['exact_match_acc'] if primary_val_metrics else 0.0
             
             # Save best model
             model_to_save = model.module if hasattr(model, 'module') else model
@@ -4134,10 +4271,12 @@ def train_rl_real_finetune(
     # ===== Data =====
     train_csv_paths: List[str],
     train_image_dirs: List[str],
-    # ===== Validation =====
+    # ===== Validation (list of benchmarks; first one is primary for early stopping) =====
+    benchmarks: Optional[List[Dict[str, str]]] = None,
+    val_max_samples: Optional[int] = None,
+    # Legacy single-benchmark args (used if benchmarks is None)
     val_benchmark_dir: str = '',
     val_benchmark_csv: str = '',
-    val_max_samples: Optional[int] = None,
     # ===== Model =====
     pretrained_path: str = '',
     save_path: str = '',
@@ -4225,6 +4364,18 @@ def train_rl_real_finetune(
               f'exact_match={reward_exact_match_weight}')
         print(f'rl_method={rl_method}, mrt_alpha={mrt_alpha}, '
               f'reward_mode={reward_mode}')
+
+    # ===== Normalize benchmark list =====
+    if benchmarks is None:
+        if val_benchmark_dir and val_benchmark_csv:
+            benchmarks = [{'name': os.path.splitext(os.path.basename(val_benchmark_csv))[0],
+                           'dir': val_benchmark_dir, 'csv': val_benchmark_csv}]
+        else:
+            benchmarks = []
+    if is_main_process() and benchmarks:
+        print(f'Validation benchmarks ({len(benchmarks)}):')
+        for bm in benchmarks:
+            print(f'  {bm["name"]}: {bm["csv"]}')
 
     # ===== Vocab + Model =====
     vocab = MolScannerVocab(n_bins=n_bins)
@@ -4544,20 +4695,27 @@ def train_rl_real_finetune(
             print(f'\nEpoch {epoch}: avg_reward={avg_reward:.4f}, avg_loss={avg_loss:.4f}')
 
         # ===== Validation =====
-        if val_benchmark_dir and val_benchmark_csv:
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+        primary_val_metrics = None
+        for bm_idx, bm in enumerate(benchmarks):
             val_results = validate(
                 model=model,
-                benchmark_dir=val_benchmark_dir,
-                benchmark_csv_path=val_benchmark_csv,
+                benchmark_dir=bm['dir'],
+                benchmark_csv_path=bm['csv'],
                 device=device,
                 epoch=epoch,
                 writer=writer,
                 global_step=global_step,
                 beam_size=1,
                 max_samples=val_max_samples,
+                benchmark_name=bm['name'],
             )
+            if bm_idx == 0:
+                primary_val_metrics = val_results
 
-            val_acc = val_results.get('exact_match_acc', 0.0)
+        if primary_val_metrics is not None:
+            val_acc = primary_val_metrics.get('exact_match_acc', 0.0)
 
             if is_main_process():
                 if val_acc > best_val_acc:

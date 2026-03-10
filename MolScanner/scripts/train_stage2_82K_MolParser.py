@@ -50,6 +50,10 @@ if __name__ == '__main__':
                         help='Reward similarity mode')
     parser.add_argument('--gpu', type=str, default='0',
                         help='Comma-separated GPU ids (default: "0")')
+    parser.add_argument('--val_benchmarks', type=str, nargs='+',
+                        default=['USPTO', 'JPO'],
+                        help='Validation benchmark names (default: USPTO JPO). '
+                             'First one is primary for early stopping.')
     args = parser.parse_args()
 
     os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
@@ -70,6 +74,16 @@ if __name__ == '__main__':
     elif args.resume:
         resume_path = str(log_dir / "checkpoint_resume.pth")
 
+    # ===== Build validation benchmark list =====
+    val_benchmarks = []
+    for bm_name in args.val_benchmarks:
+        bm_dir = real_dir / bm_name
+        bm_csv = real_dir / f"{bm_name}.csv"
+        if not bm_csv.exists():
+            print(f"WARNING: benchmark CSV not found: {bm_csv}, skipping")
+            continue
+        val_benchmarks.append({'name': bm_name, 'dir': str(bm_dir), 'csv': str(bm_csv)})
+
     # Training data: MolParser sft_real (~82K)
     train_csv_paths = [
         str(data_dir / "molparser_sft_real" / "sft_real.csv"),
@@ -86,9 +100,8 @@ if __name__ == '__main__':
         train_csv_paths=train_csv_paths,
         train_image_dirs=train_image_dirs,
 
-        # validation (USPTO held out)
-        val_benchmark_dir=str(real_dir / "USPTO"),
-        val_benchmark_csv=str(real_dir / "USPTO.csv"),
+        # validation benchmarks
+        benchmarks=val_benchmarks,
         val_max_samples=50 if FAST_TEST else None,
 
         # model

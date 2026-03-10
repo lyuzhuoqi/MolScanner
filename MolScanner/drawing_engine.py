@@ -2,11 +2,13 @@ from indigo import Indigo
 from indigo.renderer import IndigoRenderer
 
 import random
+import os
 from typing import Dict, Any
 import numpy as np
 import string
 import re
 import cv2
+from PIL import Image, ImageDraw, ImageFont
 
 cv2.setNumThreads(1)
 
@@ -395,6 +397,165 @@ def generate_output_smiles(indigo, mol):
 
 
 # ---------------------- Functions for Augmentation ------------------------------------
+_CJK_RANGES = [
+    (0x3000, 0x9FFF),   # CJK Unified, Hiragana, Katakana, punctuation, etc.
+    (0xF900, 0xFAFF),   # CJK Compatibility Ideographs
+    (0xFF00, 0xFFEF),   # Full-width forms
+]
+
+def _has_cjk(text: str) -> bool:
+    for ch in text:
+        cp = ord(ch)
+        for lo, hi in _CJK_RANGES:
+            if lo <= cp <= hi:
+                return True
+    return False
+
+
+_CJK_FONT_DIR = os.path.expanduser('~/.local/share/fonts')
+_CJK_FONT_CACHE = {}
+
+def _get_cjk_font(size: int):
+    if size in _CJK_FONT_CACHE:
+        return _CJK_FONT_CACHE[size]
+    for name in ('NotoSansCJK-Regular.ttc', 'NotoSansCJK-Medium.ttc'):
+        path = os.path.join(_CJK_FONT_DIR, name)
+        if os.path.isfile(path):
+            font = ImageFont.truetype(path, size)
+            _CJK_FONT_CACHE[size] = font
+            return font
+    font = ImageFont.load_default()
+    _CJK_FONT_CACHE[size] = font
+    return font
+
+
+def _overlay_comment(img: np.ndarray, text: str, font_size: int = 20,
+                     alignment: float = 0.5, position: str = 'bottom',
+                     offset: int = 10) -> np.ndarray:
+    """Draw *text* onto a numpy BGR image using Pillow (supports CJK)."""
+    pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    font = _get_cjk_font(font_size)
+    bbox = font.getbbox(text)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    pad = offset + th + 6
+    w = max(pil_img.width, tw + 10)
+    if position == 'top':
+        new_img = Image.new('RGB', (w, pil_img.height + pad), (255, 255, 255))
+        new_img.paste(pil_img, ((w - pil_img.width) // 2, pad))
+        ty = offset + 2
+    else:
+        new_img = Image.new('RGB', (w, pil_img.height + pad), (255, 255, 255))
+        new_img.paste(pil_img, ((w - pil_img.width) // 2, 0))
+        ty = pil_img.height + offset
+    tx = int((w - tw) * alignment)
+    draw = ImageDraw.Draw(new_img)
+    draw.text((tx, ty), text, fill=(0, 0, 0), font=font)
+    return cv2.cvtColor(np.array(new_img), cv2.COLOR_RGB2BGR)
+
+
+def _gen_rand_comment():
+    """Generate a random comment string mimicking real patent figure captions."""
+    category = random.choices(
+        ['numbered', 'bracketed', 'compound_name', 'property', 'cjk_label'],
+        weights=[3, 3, 2, 1, 3],
+        # weights=[0, 0, 0, 0, 1],
+    )[0]
+
+    if category == 'numbered':
+        templates = [
+            lambda: f"{random.randint(1, 20)}{random.choice(string.ascii_letters)}",
+            lambda: f"Fig. {random.randint(1, 30)}",
+            lambda: f"Fig.{random.randint(1, 30)}",
+            lambda: f"Compound {random.randint(1, 50)}",
+            lambda: f"Structure {random.randint(1, 20)}",
+            lambda: random.choice(['I', 'II', 'III', 'IV', 'V', 'VI', 'VII',
+                                   'VIII', 'IX', 'X', 'XI', 'XII']),
+            lambda: f"Scheme {random.randint(1, 10)}",
+            lambda: f"Formula {random.randint(1, 20)}",
+            lambda: f"Ex. {random.randint(1, 50)}",
+            lambda: f"Example {random.randint(1, 50)}",
+            lambda: f"Table {random.randint(1, 10)}",
+            lambda: f"No. {random.randint(1, 100)}",
+        ]
+        return random.choice(templates)()
+
+    if category == 'bracketed':
+        core = random.choice([
+            str(random.randint(1, 50)),
+            random.choice(['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII']),
+            f"{random.randint(1, 20)}{random.choice('abcdef')}",
+            f"{random.choice(['I', 'II', 'III'])}-{random.choice('abcdef')}",
+        ])
+        l, r = random.choice([
+            ('(', ')'), ('[', ']'), ('（', '）'), ('【', '】'), ('<', '>'),
+        ])
+        prefix = random.choice(['', '', '', 'Compound ', 'Formula ', 'Cpd. ',
+                                '化合物', '式', '実施例', '实施例'])
+        return f"{prefix}{l}{core}{r}"
+
+    if category == 'compound_name':
+        en_names = [
+            'Aspirin', 'Ibuprofen', 'Paracetamol', 'Metformin', 'Atorvastatin',
+            'Omeprazole', 'Amlodipine', 'Losartan', 'Cetirizine', 'Diclofenac',
+            'Naproxen', 'Captopril', 'Lisinopril', 'Simvastatin', 'Clopidogrel',
+            'Erlotinib', 'Sorafenib', 'Gefitinib', 'Dasatinib', 'Nilotinib',
+        ]
+        jp_names = [
+            'アスピリン', 'イブプロフェン', 'メトホルミン', 'オメプラゾール',
+            'アムロジピン', 'ロサルタン', 'セチリジン', 'ジクロフェナク',
+            'カプトプリル', 'シンバスタチン', 'エルロチニブ', 'ゲフィチニブ',
+        ]
+        cn_names = [
+            '阿司匹林', '布洛芬', '对乙酰氨基酚', '二甲双胍', '阿托伐他汀',
+            '奥美拉唑', '氨氯地平', '氯沙坦', '西替利嗪', '双氯芬酸',
+            '卡托普利', '辛伐他汀', '厄洛替尼', '吉非替尼', '达沙替尼',
+        ]
+        return random.choice(en_names + jp_names + cn_names)
+
+    if category == 'property':
+        en_props = [
+            f"m.p. {random.randint(50, 300)} C",
+            f"MW: {random.randint(100, 800)}",
+            f"b.p. {random.randint(30, 250)} C",
+            f"yield: {random.randint(10, 99)}%",
+            f"purity: {random.randint(90, 99)}.{random.randint(0, 9)}%",
+            f"IC50 = {random.randint(1, 500)} nM",
+            f"Ki = {random.randint(1, 100)} nM",
+        ]
+        jp_props = [
+            f"融点: {random.randint(50, 300)} C",
+            f"分子量: {random.randint(100, 800)}",
+            f"沸点: {random.randint(30, 250)} C",
+            f"収率: {random.randint(10, 99)}%",
+        ]
+        cn_props = [
+            f"熔点: {random.randint(50, 300)} C",
+            f"分子量: {random.randint(100, 800)}",
+            f"沸点: {random.randint(30, 250)} C",
+            f"收率: {random.randint(10, 99)}%",
+        ]
+        return random.choice(en_props + jp_props + cn_props)
+
+    # cjk_label
+    jp_labels = [
+        f"化合物{random.randint(1, 50)}",
+        f"式({random.choice(['I', 'II', 'III', 'IV', 'V'])})",
+        f"構造式{random.randint(1, 20)}",
+        f"実施例{random.randint(1, 30)}",
+        f"参考例{random.randint(1, 20)}",
+        '一般式', '中間体',
+    ]
+    cn_labels = [
+        f"化合物{random.randint(1, 50)}",
+        f"式({random.choice(['I', 'II', 'III', 'IV', 'V'])})",
+        f"结构式{random.randint(1, 20)}",
+        f"实施例{random.randint(1, 30)}",
+        f"参考例{random.randint(1, 20)}",
+        '通式', '中间体',
+    ]
+    return random.choice(jp_labels + cn_labels)
+
+
 def _generate_style_config(mol, default_drawing_style=False):
     """
     Generate drawing style configuration dict for Indigo rendering.
@@ -430,11 +591,25 @@ def _generate_style_config(mol, default_drawing_style=False):
             indigo_option_config['render-atom-ids-visible'] = True
         
         if random.random() < INDIGO_COMMENT_PROB:
-            indigo_option_config['render-comment'] = str(random.randint(1, 20)) + random.choice(string.ascii_letters)
-            indigo_option_config['render-comment-font-size'] = random.randint(40, 60)
-            indigo_option_config['render-comment-alignment'] = random.choice([0, 0.5, 1])
-            indigo_option_config['render-comment-position'] = random.choice(['top', 'bottom'])
-            indigo_option_config['render-comment-offset'] = random.randint(2, 30)
+            comment_text = _gen_rand_comment()
+            comment_font_size = random.randint(40, 60)
+            comment_alignment = random.choice([0, 0.5, 1])
+            comment_position = random.choice(['top', 'bottom'])
+            comment_offset = random.randint(2, 30)
+            if _has_cjk(comment_text):
+                mol_config['comment_overlay'] = {
+                    'text': comment_text,
+                    'font_size': comment_font_size,
+                    'alignment': comment_alignment,
+                    'position': comment_position,
+                    'offset': comment_offset,
+                }
+            else:
+                indigo_option_config['render-comment'] = comment_text
+                indigo_option_config['render-comment-font-size'] = comment_font_size
+                indigo_option_config['render-comment-alignment'] = comment_alignment
+                indigo_option_config['render-comment-position'] = comment_position
+                indigo_option_config['render-comment-offset'] = comment_offset
 
         if random.random() < INDIGO_DEARMOTIZE_PROB: # The way aromatic rings are represented
             mol_config['mol.dearomatize'] = True
@@ -514,6 +689,9 @@ def generate_image_from_smiles(smiles, n_bins=None,
         mol.layout()
         buf = renderer.renderToBuffer(mol)
         img = cv2.imdecode(np.asarray(bytearray(buf), dtype=np.uint8), 1) # BGR format
+        if style_config and 'comment_overlay' in mol_config:
+            co = mol_config['comment_overlay']
+            img = _overlay_comment(img, **co)
         graph = get_graph(mol, img, n_bins=n_bins)
         success = True
     except Exception:
@@ -611,6 +789,9 @@ def generate_image_from_graph(graph,
         mol.layout()
         buf = renderer.renderToBuffer(mol)
         img = cv2.imdecode(np.asarray(bytearray(buf), dtype=np.uint8), 1)  # 1 flag for color
+        if mol_config and 'comment_overlay' in mol_config:
+            co = mol_config['comment_overlay']
+            img = _overlay_comment(img, **co)
         success = True
     except Exception:
         if debug:
