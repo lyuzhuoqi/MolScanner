@@ -101,12 +101,14 @@ def main():
         {'name': 'chemdraw', 'benchmark_dir': str(data_dir / "benchmark/synthetic/chemdraw"), 'csv_path': str(data_dir / "benchmark/synthetic/chemdraw.csv")},
         {'name': 'CLEF',     'benchmark_dir': str(data_dir / "benchmark/real/CLEF"),          'csv_path': str(data_dir / "benchmark/real/CLEF.csv")},
         {'name': 'JPO',      'benchmark_dir': str(data_dir / "benchmark/real/JPO"),           'csv_path': str(data_dir / "benchmark/real/JPO.csv")},
+        {'name': 'coloredBG', 'benchmark_dir': str(data_dir / "benchmark/real/coloredBG"), 'csv_path': str(data_dir / "benchmark/real/coloredBG.csv")},
         {'name': 'UOB',      'benchmark_dir': str(data_dir / "benchmark/real/UOB"),           'csv_path': str(data_dir / "benchmark/real/UOB.csv")},
         {'name': 'USPTO',    'benchmark_dir': str(data_dir / "benchmark/real/USPTO"),         'csv_path': str(data_dir / "benchmark/real/USPTO.csv")},
         {'name': 'USPTO-10K',  'benchmark_dir': str(data_dir / "benchmark/real/USPTO-10K"),  'csv_path': str(data_dir / "benchmark/real/USPTO-10K.csv")},
         {'name': 'staker',   'benchmark_dir': str(data_dir / "benchmark/real/staker"),        'csv_path': str(data_dir / "benchmark/real/staker.csv")},
         {'name': 'acs',      'benchmark_dir': str(data_dir / "benchmark/real/acs"),           'csv_path': str(data_dir / "benchmark/real/acs.csv")},
         {'name': 'WildMol-10K', 'benchmark_dir': str(data_dir / "benchmark/real/WildMol-10K"), 'csv_path': str(data_dir / "benchmark/real/WildMol-10K.csv")},
+
     ]
 
     results = evaluate_benchmarks(model, benchmarks, beam_size=args.beam_size)
