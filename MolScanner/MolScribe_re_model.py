@@ -3672,6 +3672,72 @@ def _fast_render_smiles(smiles: str) -> Tuple[np.ndarray, bool]:
         return _blank_image(), False
 
 
+# ======================== Visual Reward Encoder Loading ========================
+
+def load_visual_reward_encoder(
+    checkpoint_path: str,
+    device: torch.device,
+    image_size: Tuple[int, int] = (384, 384),
+    embedding_dim: int = 128,
+) -> Tuple[nn.Module, A.Compose, object]:
+    """Load a frozen SiameseNetwork (MolDiscriminator) as visual reward encoder.
+
+    Args:
+        checkpoint_path: Path to the SiameseNetwork checkpoint (.pth).
+        device: Target device.
+        image_size: Image size for preprocessing.
+        embedding_dim: Embedding dimension of the SiameseNetwork.
+
+    Returns:
+        (encoder, transforms) — frozen encoder module and its preprocessing pipeline.
+    """
+    from MolDiscriminator_model import SiameseNetwork, PadToSquare as DiscPadToSquare
+
+    encoder = SiameseNetwork(embedding_dim=embedding_dim, pretrained=False)
+    state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    # Handle checkpoint that wraps state_dict inside a dict
+    if isinstance(state_dict, dict) and 'model_state_dict' in state_dict:
+        state_dict = state_dict['model_state_dict']
+    encoder.load_state_dict(state_dict)
+    encoder = encoder.to(device).eval()
+    encoder.requires_grad_(False)
+
+    pad_to_square = DiscPadToSquare(fill=255)
+    from MolDiscriminator_model import AdaptiveResize as DiscAdaptiveResize
+    transforms = A.Compose([
+        DiscAdaptiveResize(height=image_size[0], width=image_size[1]),  # INTER_LINEAR↑ / INTER_AREA↓
+        A.ToGray(num_output_channels=3),
+        A.Normalize(),
+        ToTensorV2(),
+    ])
+    return encoder, transforms, pad_to_square
+
+
+def _encode_with_external_encoder(
+    images_np: List[np.ndarray],
+    encoder: nn.Module,
+    transforms: A.Compose,
+    pad_to_square,
+    device: torch.device,
+    chunk_size: int = 32,
+) -> torch.Tensor:
+    """Encode a list of numpy images using an external SiameseNetwork encoder."""
+    tensors = []
+    for img in images_np:
+        img_sq, _ = pad_to_square(img)
+        tensors.append(transforms(image=img_sq)['image'])
+    batch = torch.stack(tensors).to(device)
+
+    feat_chunks = []
+    with torch.no_grad():
+        for i in range(0, len(tensors), chunk_size):
+            chunk = batch[i:i + chunk_size]
+            feat_chunks.append(encoder.forward_once(chunk))
+    feats = torch.cat(feat_chunks, dim=0)
+    del batch
+    return feats
+
+
 # ======================== REINFORCE Loss ========================
 
 def compute_reinforce_loss(
@@ -3690,6 +3756,9 @@ def compute_reinforce_loss(
     reward_mode: str = 'tanimoto',
     frozen_encoder: Optional[nn.Module] = None,
     frozen_pos_enc: Optional[nn.Module] = None,
+    visual_reward_encoder: Optional[nn.Module] = None,
+    visual_reward_transforms: Optional[A.Compose] = None,
+    visual_reward_pad_to_square: Optional[object] = None,
 ) -> Tuple[torch.Tensor, Dict]:
     """REINFORCE loss with composite reward for molecule image recognition.
 
@@ -3731,6 +3800,11 @@ def compute_reinforce_loss(
         reward_mode: ``'tanimoto'``, ``'edit_distance'``, or ``'visual'``.
         frozen_encoder: Frozen image_encoder copy for stable visual reward.
         frozen_pos_enc: Frozen pos_enc_2d copy for stable visual reward.
+        visual_reward_encoder: External frozen encoder (e.g. MolDiscriminator
+            SiameseNetwork) for visual reward. When provided, overrides
+            frozen_encoder/frozen_pos_enc.
+        visual_reward_transforms: Preprocessing transforms for the external encoder.
+        visual_reward_pad_to_square: Pad-to-square callable for the external encoder.
 
     Returns:
         loss: Scalar REINFORCE loss with gradient graph.
@@ -3839,55 +3913,64 @@ def compute_reinforce_loss(
         # Both GT and predicted SMILES are rendered with the SAME RDKit
         # renderer to eliminate domain gap. A frozen reference encoder
         # gives stable reward signals that don't drift during training.
+        _use_external = (visual_reward_encoder is not None)
 
         _encode_chunk = 32
-        _ref_encoder = frozen_encoder if frozen_encoder is not None else model.image_encoder
-        _ref_pos_enc = frozen_pos_enc if frozen_pos_enc is not None else model.pos_enc_2d
 
-        # Render GT SMILES to images with RDKit (same renderer as pred)
-        gt_rendered_tensors = []
+        # Render GT and predicted SMILES to numpy images
+        gt_rendered_np = []
         for smi in gt_canonical:
             img_np, _ = _fast_render_smiles(smi)
-            gt_rendered_tensors.append(
-                model.inference_transforms(image=img_np)['image']
-            )
-        gt_rendered_batch = torch.stack(gt_rendered_tensors).to(device)
+            gt_rendered_np.append(img_np)
 
-        # Encode GT rendered images in chunks (no grad, using frozen encoder)
-        gt_feat_chunks = []
-        with torch.no_grad():
-            for i in range(0, total_seqs, _encode_chunk):
-                chunk = gt_rendered_batch[i:i + _encode_chunk]
-                feat = _ref_encoder(chunk)
-                feat = _ref_pos_enc(feat)
-                feat = feat.float().mean(dim=[2, 3])
-                gt_feat_chunks.append(feat)
-        gt_feat = torch.cat(gt_feat_chunks, dim=0)  # [total_seqs, d_model]
-        del gt_rendered_batch
-
-        # Render all predicted SMILES to images with RDKit
-        pred_rendered_tensors = []
+        pred_rendered_np = []
         render_success_count = 0
         for smi in sampled_smiles:
             img_np, ok = _fast_render_smiles(smi)
-            pred_rendered_tensors.append(
-                model.inference_transforms(image=img_np)['image']
-            )
+            pred_rendered_np.append(img_np)
             if ok:
                 render_success_count += 1
-        pred_rendered_batch = torch.stack(pred_rendered_tensors).to(device)
 
-        # Encode predicted rendered images in chunks (no grad, using frozen encoder)
-        pred_feat_chunks = []
-        with torch.no_grad():
-            for i in range(0, total_seqs, _encode_chunk):
-                chunk = pred_rendered_batch[i:i + _encode_chunk]
-                feat = _ref_encoder(chunk)
-                feat = _ref_pos_enc(feat)
-                feat = feat.float().mean(dim=[2, 3])
-                pred_feat_chunks.append(feat)
-        pred_feat = torch.cat(pred_feat_chunks, dim=0)  # [total_seqs, d_model]
-        del pred_rendered_batch
+        if _use_external:
+            # Use external encoder (e.g. MolDiscriminator SiameseNetwork)
+            gt_feat = _encode_with_external_encoder(
+                gt_rendered_np, visual_reward_encoder,
+                visual_reward_transforms, visual_reward_pad_to_square,
+                device, _encode_chunk)
+            pred_feat = _encode_with_external_encoder(
+                pred_rendered_np, visual_reward_encoder,
+                visual_reward_transforms, visual_reward_pad_to_square,
+                device, _encode_chunk)
+        else:
+            # Use frozen MolScribe encoder (default)
+            _ref_encoder = frozen_encoder if frozen_encoder is not None else model.image_encoder
+            _ref_pos_enc = frozen_pos_enc if frozen_pos_enc is not None else model.pos_enc_2d
+
+            gt_rendered_tensors = [model.inference_transforms(image=img)['image'] for img in gt_rendered_np]
+            gt_rendered_batch = torch.stack(gt_rendered_tensors).to(device)
+            gt_feat_chunks = []
+            with torch.no_grad():
+                for i in range(0, total_seqs, _encode_chunk):
+                    chunk = gt_rendered_batch[i:i + _encode_chunk]
+                    feat = _ref_encoder(chunk)
+                    feat = _ref_pos_enc(feat)
+                    feat = feat.float().mean(dim=[2, 3])
+                    gt_feat_chunks.append(feat)
+            gt_feat = torch.cat(gt_feat_chunks, dim=0)
+            del gt_rendered_batch
+
+            pred_rendered_tensors = [model.inference_transforms(image=img)['image'] for img in pred_rendered_np]
+            pred_rendered_batch = torch.stack(pred_rendered_tensors).to(device)
+            pred_feat_chunks = []
+            with torch.no_grad():
+                for i in range(0, total_seqs, _encode_chunk):
+                    chunk = pred_rendered_batch[i:i + _encode_chunk]
+                    feat = _ref_encoder(chunk)
+                    feat = _ref_pos_enc(feat)
+                    feat = feat.float().mean(dim=[2, 3])
+                    pred_feat_chunks.append(feat)
+            pred_feat = torch.cat(pred_feat_chunks, dim=0)
+            del pred_rendered_batch
 
         # Cosine similarity, clamped to [0, 1]
         cos_sims = F.cosine_similarity(gt_feat, pred_feat, dim=1).clamp(min=0.0)
@@ -3982,6 +4065,9 @@ def compute_mrt_loss(
     reward_mode: str = 'tanimoto',
     frozen_encoder: Optional[nn.Module] = None,
     frozen_pos_enc: Optional[nn.Module] = None,
+    visual_reward_encoder: Optional[nn.Module] = None,
+    visual_reward_transforms: Optional[A.Compose] = None,
+    visual_reward_pad_to_square: Optional[object] = None,
 ) -> Tuple[torch.Tensor, Dict]:
     """Minimum Risk Training (MRT) loss for molecule image recognition.
 
@@ -4109,46 +4195,60 @@ def compute_mrt_loss(
         extra_info['mean_edit_similarity'] = similarity_sum / max(total_seqs, 1)
 
     elif reward_mode == 'visual':
+        _use_external = (visual_reward_encoder is not None)
         _encode_chunk = 32
-        _ref_encoder = frozen_encoder if frozen_encoder is not None else model.image_encoder
-        _ref_pos_enc = frozen_pos_enc if frozen_pos_enc is not None else model.pos_enc_2d
 
-        gt_rendered_tensors = []
+        gt_rendered_np = []
         for smi in gt_canonical:
             img_np, _ = _fast_render_smiles(smi)
-            gt_rendered_tensors.append(model.inference_transforms(image=img_np)['image'])
-        gt_rendered_batch = torch.stack(gt_rendered_tensors).to(device)
+            gt_rendered_np.append(img_np)
 
-        gt_feat_chunks = []
-        with torch.no_grad():
-            for i in range(0, total_seqs, _encode_chunk):
-                chunk = gt_rendered_batch[i:i + _encode_chunk]
-                feat = _ref_encoder(chunk)
-                feat = _ref_pos_enc(feat)
-                feat = feat.float().mean(dim=[2, 3])
-                gt_feat_chunks.append(feat)
-        gt_feat = torch.cat(gt_feat_chunks, dim=0)
-        del gt_rendered_batch
-
-        pred_rendered_tensors = []
+        pred_rendered_np = []
         render_success_count = 0
         for smi in sampled_smiles:
             img_np, ok = _fast_render_smiles(smi)
-            pred_rendered_tensors.append(model.inference_transforms(image=img_np)['image'])
+            pred_rendered_np.append(img_np)
             if ok:
                 render_success_count += 1
-        pred_rendered_batch = torch.stack(pred_rendered_tensors).to(device)
 
-        pred_feat_chunks = []
-        with torch.no_grad():
-            for i in range(0, total_seqs, _encode_chunk):
-                chunk = pred_rendered_batch[i:i + _encode_chunk]
-                feat = _ref_encoder(chunk)
-                feat = _ref_pos_enc(feat)
-                feat = feat.float().mean(dim=[2, 3])
-                pred_feat_chunks.append(feat)
-        pred_feat = torch.cat(pred_feat_chunks, dim=0)
-        del pred_rendered_batch
+        if _use_external:
+            gt_feat = _encode_with_external_encoder(
+                gt_rendered_np, visual_reward_encoder,
+                visual_reward_transforms, visual_reward_pad_to_square,
+                device, _encode_chunk)
+            pred_feat = _encode_with_external_encoder(
+                pred_rendered_np, visual_reward_encoder,
+                visual_reward_transforms, visual_reward_pad_to_square,
+                device, _encode_chunk)
+        else:
+            _ref_encoder = frozen_encoder if frozen_encoder is not None else model.image_encoder
+            _ref_pos_enc = frozen_pos_enc if frozen_pos_enc is not None else model.pos_enc_2d
+
+            gt_rendered_tensors = [model.inference_transforms(image=img)['image'] for img in gt_rendered_np]
+            gt_rendered_batch = torch.stack(gt_rendered_tensors).to(device)
+            gt_feat_chunks = []
+            with torch.no_grad():
+                for i in range(0, total_seqs, _encode_chunk):
+                    chunk = gt_rendered_batch[i:i + _encode_chunk]
+                    feat = _ref_encoder(chunk)
+                    feat = _ref_pos_enc(feat)
+                    feat = feat.float().mean(dim=[2, 3])
+                    gt_feat_chunks.append(feat)
+            gt_feat = torch.cat(gt_feat_chunks, dim=0)
+            del gt_rendered_batch
+
+            pred_rendered_tensors = [model.inference_transforms(image=img)['image'] for img in pred_rendered_np]
+            pred_rendered_batch = torch.stack(pred_rendered_tensors).to(device)
+            pred_feat_chunks = []
+            with torch.no_grad():
+                for i in range(0, total_seqs, _encode_chunk):
+                    chunk = pred_rendered_batch[i:i + _encode_chunk]
+                    feat = _ref_encoder(chunk)
+                    feat = _ref_pos_enc(feat)
+                    feat = feat.float().mean(dim=[2, 3])
+                    pred_feat_chunks.append(feat)
+            pred_feat = torch.cat(pred_feat_chunks, dim=0)
+            del pred_rendered_batch
 
         cos_sims = F.cosine_similarity(gt_feat, pred_feat, dim=1).clamp(min=0.0)
         for b in range(total_seqs):
@@ -4313,6 +4413,9 @@ def train_rl_real_finetune(
     # ===== RL method =====
     rl_method: str = 'reinforce',
     mrt_alpha: float = 1.0,
+    # ===== External visual reward encoder =====
+    visual_reward_encoder_path: Optional[str] = None,
+    visual_reward_embedding_dim: int = 128,
     # ===== Resume =====
     resume_from: Optional[str] = None,
 ) -> List[float]:
@@ -4364,6 +4467,8 @@ def train_rl_real_finetune(
               f'exact_match={reward_exact_match_weight}')
         print(f'rl_method={rl_method}, mrt_alpha={mrt_alpha}, '
               f'reward_mode={reward_mode}')
+        if visual_reward_encoder_path:
+            print(f'visual_reward_encoder_path={visual_reward_encoder_path}')
 
     # ===== Normalize benchmark list =====
     if benchmarks is None:
@@ -4402,6 +4507,24 @@ def train_rl_real_finetune(
     frozen_pos_enc = copy.deepcopy(model.pos_enc_2d).eval()
     frozen_encoder.requires_grad_(False)
     frozen_pos_enc.requires_grad_(False)
+
+    # Optional external visual reward encoder (e.g. MolDiscriminator SiameseNetwork)
+    ext_vis_encoder = None
+    ext_vis_transforms = None
+    ext_vis_pad = None
+    if visual_reward_encoder_path and os.path.isfile(visual_reward_encoder_path):
+        if is_main_process():
+            print(f'Loading external visual reward encoder from {visual_reward_encoder_path} ...')
+        ext_vis_encoder, ext_vis_transforms, ext_vis_pad = load_visual_reward_encoder(
+            visual_reward_encoder_path, device, image_size=image_size,
+            embedding_dim=visual_reward_embedding_dim,
+        )
+        if is_main_process():
+            print(f'  External encoder loaded (embedding_dim={visual_reward_embedding_dim})')
+    elif visual_reward_encoder_path:
+        if is_main_process():
+            print(f'WARNING: visual_reward_encoder_path not found: {visual_reward_encoder_path}, '
+                  f'falling back to frozen MolScribe encoder')
 
     if world_size > 1:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True,
@@ -4620,6 +4743,9 @@ def train_rl_real_finetune(
                     reward_mode=reward_mode,
                     frozen_encoder=frozen_encoder,
                     frozen_pos_enc=frozen_pos_enc,
+                    visual_reward_encoder=ext_vis_encoder,
+                    visual_reward_transforms=ext_vis_transforms,
+                    visual_reward_pad_to_square=ext_vis_pad,
                 )
             else:
                 rl_loss, rl_info = compute_reinforce_loss(
@@ -4638,6 +4764,9 @@ def train_rl_real_finetune(
                     reward_mode=reward_mode,
                     frozen_encoder=frozen_encoder,
                     frozen_pos_enc=frozen_pos_enc,
+                    visual_reward_encoder=ext_vis_encoder,
+                    visual_reward_transforms=ext_vis_transforms,
+                    visual_reward_pad_to_square=ext_vis_pad,
                 )
 
             rl_reward = rl_info['mean_reward']
