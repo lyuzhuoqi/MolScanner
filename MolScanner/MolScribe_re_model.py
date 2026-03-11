@@ -810,7 +810,7 @@ class USPTOMolDataset(Dataset):
 
         # R-group normalisation:
         # The CSV is expected to be pre-processed by
-        #   scripts/normalise_rgroup.py
+        #   scripts/normalise_smiles.py
         # which reads the MOL-file element symbols (R, A, X, Q, L, M, …)
         # and uses RDKit canonical ordering to assign per-atom labels.
         #
@@ -844,7 +844,7 @@ class USPTOMolDataset(Dataset):
             self.df['SMILES'] = self.df['SMILES'].apply(_quick_normalise)
             if is_main_process():
                 print("[USPTOMolDataset] Applied quick R-group fallback "
-                      "(consider pre-normalising with scripts/normalise_rgroup.py)")
+                      "(consider pre-normalising with scripts/normalise_smiles.py)")
 
         # Filter out rows whose SMILES still contain characters outside the vocab
         vocab_chars = set(self.vocab.token2idx.keys())

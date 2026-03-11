@@ -15,7 +15,7 @@ accordingly:
 
 Usage
 -----
-    python normalise_rgroup.py \\
+    python normalise_smiles.py \\
         --csv  data/uspto_mol/train_680k.csv \\
         --data_dir data \\
         --output data/uspto_mol/train_680k_normalised.csv
@@ -169,6 +169,146 @@ def _get_ordered_bare_labels(
 
 
 # ---------------------------------------------------------------------------
+# Annotation fragment filtering
+# ---------------------------------------------------------------------------
+
+# Fragments that are unambiguously text annotations, not chemistry.
+_KNOWN_ANNOTATION_FRAGMENTS = frozenset([
+    '[(]', '[)]', '[[]', '[]]', ']', '[',
+    '[,]', '[;]', '[or]', '[and]',
+    '[+]', '[-]', '[=]', '[:]',
+    '[HH]', '[2HH]', '[3HH]',
+])
+
+# Regex for bracket-wrapped parenthesized labels: [(IX)], [(A)k], [(1)], etc.
+_PAREN_LABEL_RE = re.compile(r'^\[\(.*\).*\]$')
+
+# Regex for bare digit labels: [0], [1], [2], …
+_BARE_DIGIT_RE = re.compile(r'^\[\d+\]$')
+
+# Regex for bracket-wrapped lowercase single letters: [x], [i], [v], etc.
+# These are OCR artefacts — real SMILES bracket atoms are uppercase.
+_BRACKET_LOWERCASE_RE = re.compile(r'^\[[a-z]\]$')
+
+# Regex for all-lowercase inside brackets: [ii], [xx], etc.
+_BRACKET_MULTI_LOWER_RE = re.compile(r'^[a-z]{2,}$')
+
+# Regex for OCR-artifact brackets with embedded ")": [)x], [)3], etc.
+_BRACKET_PAREN_JUNK_RE = re.compile(r'^\[\).*\]$')
+
+# Characters that are never valid inside a SMILES bracket atom.
+_BRACKET_FORBIDDEN_RE = re.compile(r'[,?/!;]')
+
+# Regex for Roman-numeral look-alikes as disconnected fragments.
+# Matches fragments composed entirely of I (iodine), V (vanadium), X,
+# brackets, parentheses, H, digits, charges — e.g. I[V](I)I → "(IV)".
+_ROMAN_NUMERAL_RE = re.compile(r'^[IVX\[\]()H\d+\-]+$')
+
+# Regex for embedded bare-digit atoms anywhere in a fragment: [0]I, I[3], etc.
+# [0], [1], … are not valid SMILES atoms — they are digit OCR artefacts.
+# Isotope notation is [\d+LETTER…] (e.g. [2H]) and won't match this pattern.
+_EMBEDDED_BARE_DIGIT_RE = re.compile(r'\[\d+\]')
+
+
+def _is_annotation_fragment(frag: str) -> bool:
+    """Return True if *frag* is a text annotation rather than chemistry.
+
+    Checks for common OCR artefacts found in patent MOL files: compound
+    numbering (Roman numerals), stray parentheses, punctuation, etc.
+    """
+    if not frag:
+        return True
+
+    if frag in _KNOWN_ANNOTATION_FRAGMENTS:
+        return True
+
+    # Standalone bare digit(s): "2", "35" — not chemistry
+    if frag.isdigit():
+        return True
+
+    # Unbalanced brackets: count of [ != count of ]
+    if frag.count('[') != frag.count(']'):
+        return True
+
+    # Broken structure: ] appears before any [ — e.g. ]([, ]1[, ])=[
+    first_close = frag.find(']')
+    first_open = frag.find('[')
+    if first_close != -1 and (first_open == -1 or first_close < first_open):
+        return True
+
+    # Digit-bracket-digit splice: 1][4, 2][8, etc. — garbled OCR joins
+    if re.search(r'\d\]\[\d', frag):
+        return True
+
+    # Single bracket-wrapped token: exactly one [ and one ]
+    if (len(frag) >= 2 and frag[0] == '[' and frag[-1] == ']'
+            and frag.count('[') == 1 and frag.count(']') == 1):
+        inner = frag[1:-1]
+        # [(IX)], [(A)k], [(1)], etc.
+        if _PAREN_LABEL_RE.fullmatch(frag):
+            return True
+        # [0], [1], [2] — isolated digits (not [1*])
+        if _BARE_DIGIT_RE.fullmatch(frag):
+            return True
+        # Truncated like [1), [2)
+        if inner.endswith(')'):
+            return True
+        # Lowercase single letters: [x], [i], [v] — OCR artefacts
+        if _BRACKET_LOWERCASE_RE.fullmatch(frag):
+            return True
+        # Multi-lowercase: [ii], [xx] — OCR artefacts
+        if _BRACKET_MULTI_LOWER_RE.fullmatch(inner):
+            return True
+        # OCR junk with embedded ")": [)x], [)3], etc.
+        if _BRACKET_PAREN_JUNK_RE.fullmatch(frag):
+            return True
+        # Forbidden characters inside bracket atom: , ? / ! ;
+        if _BRACKET_FORBIDDEN_RE.search(inner):
+            return True
+        # Unmatched ( or ) inside bracket: [(X], [X)]
+        if ('(' in inner) != (')' in inner):
+            return True
+        # No element symbol: no uppercase letter, no * — e.g. [2+], [+2], [-1]
+        if not any(c.isupper() for c in inner) and '*' not in inner:
+            return True
+        # Leading charge before element: [-X], [+X] — invalid SMILES
+        if len(inner) >= 2 and inner[0] in '-+' and inner[1].isalpha():
+            return True
+        # Trailing colon without class number: [X:] — invalid atom class
+        if inner.endswith(':'):
+            return True
+
+    # Fragments containing bare-digit bracket atoms: [0]I, I[3], etc.
+    # [\d+] (digit-only bracket) is never a valid SMILES atom.
+    if _EMBEDDED_BARE_DIGIT_RE.search(frag) and frag != _EMBEDDED_BARE_DIGIT_RE.search(frag).group():
+        return True
+
+    # Roman-numeral look-alikes: disconnected fragments built entirely from
+    # I, V, X and bracket/paren/H/charge characters.
+    # Require ≥2 Roman letters so lone I (iodine) or [V] (vanadium) survive.
+    if _ROMAN_NUMERAL_RE.fullmatch(frag):
+        letters = re.sub(r'[\[\]()H\d+\-]', '', frag)
+        if len(letters) >= 2 and all(c in 'IVX' for c in letters):
+            return True
+
+    return False
+
+
+def remove_annotation_fragments(smiles: str) -> str:
+    """Remove disconnected annotation fragments from a SMILES string.
+
+    Splits on ``.``, drops fragments identified as text annotations
+    (Roman numerals, stray parentheses, punctuation, etc.), and
+    rejoins the remaining fragments.
+    """
+    if not isinstance(smiles, str) or '.' not in smiles:
+        return smiles
+    frags = smiles.split('.')
+    kept = [f for f in frags if not _is_annotation_fragment(f)]
+    return '.'.join(kept) if kept else smiles  # never return empty
+
+
+# ---------------------------------------------------------------------------
 # Bare-star counting / replacement helpers
 # ---------------------------------------------------------------------------
 def _count_bare_stars(smiles: str) -> int:
@@ -213,13 +353,22 @@ def _replace_bare_stars(smiles: str, labels: List[str]) -> str:
 # ---------------------------------------------------------------------------
 # Core normalisation
 # ---------------------------------------------------------------------------
-def normalise_rgroup(smiles: str, mol_path: str = None) -> str:
+def normalise_rgroup(
+    smiles: str, mol_path: str = None, *, strip_annotations: bool = True,
+) -> str:
     """Normalise wildcard atoms in *smiles* using the MOL file at *mol_path*.
+
+    If *strip_annotations* is True (default), disconnected annotation
+    fragments (Roman-numeral labels, stray parentheses, etc.) are removed
+    before normalisation.
 
     Returns the normalised SMILES string.
     """
     if not isinstance(smiles, str):
         return smiles
+
+    if strip_annotations:
+        smiles = remove_annotation_fragments(smiles)
 
     # [N*] → [RN]  (numbered wildcard → named R-group)
     smiles = re.sub(r'\[(\d+)\*\]', r'[R\1]', smiles)

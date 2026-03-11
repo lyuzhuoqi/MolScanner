@@ -94,6 +94,7 @@ if __name__ == '__main__':
     if args.data_mode in ('joint', 'uspto'):
         uspto_dir = data_dir / "uspto_mol"
         csv_candidates = [
+            uspto_dir / "train_680k_normalised.csv",
             uspto_dir / "train_680k.csv",
             uspto_dir / "train.csv",
         ]
