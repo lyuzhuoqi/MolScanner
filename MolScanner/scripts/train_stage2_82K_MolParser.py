@@ -54,6 +54,11 @@ if __name__ == '__main__':
                         default=['USPTO', 'JPO'],
                         help='Validation benchmark names (default: USPTO JPO). '
                              'First one is primary for early stopping.')
+    parser.add_argument('--visual_reward_encoder', type=str, default=None,
+                        help='Path to external image encoder checkpoint (e.g. '
+                             'MolDiscriminator SiameseNetwork .pth) for visual reward')
+    parser.add_argument('--visual_reward_embedding_dim', type=int, default=128,
+                        help='Embedding dim of the external visual reward encoder (default: 128)')
     args = parser.parse_args()
 
     os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
@@ -147,6 +152,10 @@ if __name__ == '__main__':
         # RL method
         rl_method=args.rl_method,
         mrt_alpha=args.mrt_alpha,
+
+        # External visual reward encoder
+        visual_reward_encoder_path=args.visual_reward_encoder,
+        visual_reward_embedding_dim=args.visual_reward_embedding_dim,
 
         # resume
         resume_from=resume_path,

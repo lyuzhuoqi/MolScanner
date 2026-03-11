@@ -145,6 +145,27 @@ HARD_NEG_CONDENSED_PROB = 0.2     # Probability of adding a condensed formula
 HARD_NEG_FUNCTIONAL_GROUP_PROB = 0.3  # Probability of replacing functional groups
 
 
+class AdaptiveResize(A.ImageOnlyTransform):
+    """Resize with adaptive interpolation.
+
+    Uses INTER_LINEAR (bilinear) when upscaling and INTER_AREA when downscaling,
+    matching OpenCV best-practice for each direction.
+    """
+
+    def __init__(self, height, width, p=1.0):
+        super().__init__(p=p)
+        self.height = height
+        self.width = width
+
+    def apply(self, img, **params):
+        h, w = img.shape[:2]
+        interpolation = cv2.INTER_AREA if (h > self.height or w > self.width) else cv2.INTER_LINEAR
+        return cv2.resize(img, (self.width, self.height), interpolation=interpolation)
+
+    def get_transform_init_args_names(self):
+        return ('height', 'width')
+
+
 class PadToSquare:
     """
     Simple callable that pads an image to be square and adjusts keypoints.
@@ -840,7 +861,7 @@ class TripletMoleculeDataset(Dataset):
         self.img_transforms = A.Compose(self.img_transforms_list)
         # 3. Final transforms (after padding, no keypoints needed)
         self.post_transforms = A.Compose([
-            A.Resize(height=self.image_size[0], width=self.image_size[1], interpolation=cv2.INTER_AREA),
+            AdaptiveResize(height=self.image_size[0], width=self.image_size[1]),  # INTER_LINEAR↑ / INTER_AREA↓
             A.ToGray(num_output_channels=3),  # Keep 3 channels for pretrained backbone
             A.Normalize(),  # ImageNet normalization
             ToTensorV2(),
@@ -1484,8 +1505,7 @@ class MoleculeDiscriminator:
         # Inference preprocessing (matches training post_transforms)
         self._pad_to_square = PadToSquare(fill=255)
         self._inference_transforms = A.Compose([
-            A.Resize(height=self.image_size[0], width=self.image_size[1],
-                     interpolation=cv2.INTER_AREA),
+            AdaptiveResize(height=self.image_size[0], width=self.image_size[1]),  # INTER_LINEAR↑ / INTER_AREA↓
             A.ToGray(num_output_channels=3),
             A.Normalize(),  # ImageNet normalization
             ToTensorV2(),
