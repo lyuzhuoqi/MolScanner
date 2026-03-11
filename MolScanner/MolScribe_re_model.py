@@ -808,26 +808,43 @@ class USPTOMolDataset(Dataset):
         self.image_size = image_size
         self.df = pd.read_csv(csv_path)
 
-        # Normalise R-group representations to match synthetic data:
-        #   [N*] → [RN]  (e.g. [1*] → [R1], [69*] → [R69])
-        #   bare * → [R]
-        # This eliminates the label conflict where the same visual element
-        # (e.g. "R1" in the image) has different SMILES in synthetic vs USPTO.
-        def _normalise_rgroup(smiles: str) -> str:
+        # R-group normalisation:
+        # The CSV is expected to be pre-processed by
+        #   scripts/normalise_rgroup.py
+        # which reads the MOL-file element symbols (R, A, X, Q, L, M, …)
+        # and uses RDKit canonical ordering to assign per-atom labels.
+        #
+        # As a lightweight fallback (e.g. for un-normalised CSVs), apply the
+        # simple regex conversions that don't require MOL file access:
+        #   [N*] → [RN]   and   bare * → [R]
+        def _quick_normalise(smiles: str) -> str:
             if not isinstance(smiles, str):
                 return smiles
-            # [N*] → [RN]  (numbered wildcard → named R-group)
             smiles = re.sub(r'\[(\d+)\*\]', r'[R\1]', smiles)
-            # bare * → [R]  (unnumbered wildcard → generic R-group)
-            smiles = re.sub(r'(?<!\[)\*', '[R]', smiles)
-            return smiles
+            if '*' not in smiles:
+                return smiles
+            parts: List[str] = []
+            i = 0
+            while i < len(smiles):
+                if smiles[i] == '[':
+                    j = smiles.find(']', i + 1)
+                    if j == -1:
+                        j = len(smiles) - 1
+                    parts.append(smiles[i:j + 1])
+                    i = j + 1
+                elif smiles[i] == '*':
+                    parts.append('[R]')
+                    i += 1
+                else:
+                    parts.append(smiles[i])
+                    i += 1
+            return ''.join(parts)
 
-        self.df['SMILES'] = self.df['SMILES'].apply(_normalise_rgroup)
-        if is_main_process():
-            n_converted = (self.df['SMILES'] != pd.read_csv(csv_path)['SMILES']).sum()
-            if n_converted > 0:
-                print(f"[USPTOMolDataset] Normalised R-group notation in "
-                      f"{n_converted}/{len(self.df)} rows")
+        if self.df['SMILES'].str.contains(r'\*', na=False, regex=True).any():
+            self.df['SMILES'] = self.df['SMILES'].apply(_quick_normalise)
+            if is_main_process():
+                print("[USPTOMolDataset] Applied quick R-group fallback "
+                      "(consider pre-normalising with scripts/normalise_rgroup.py)")
 
         # Filter out rows whose SMILES still contain characters outside the vocab
         vocab_chars = set(self.vocab.token2idx.keys())
