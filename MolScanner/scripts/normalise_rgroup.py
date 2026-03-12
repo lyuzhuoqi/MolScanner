@@ -106,8 +106,8 @@ def _get_ordered_bare_labels(
     2. Identify non-numbered wildcard atoms (``atomic_num == 0``,
        ``isotope == 0``).
     3. Look up each atom's element symbol from the MOL-file text.
-    4. Assign unique temporary isotopes, generate canonical SMILES, and
-       read back the isotope order to establish the correspondence.
+    4. Generate canonical SMILES and use ``_smilesAtomOutputOrder``
+       to establish the correspondence without perturbing the molecule.
 
     Returns ``None`` on failure, or a list of label strings (one per bare
     ``*``, in the order they appear in canonical SMILES).
@@ -126,10 +126,18 @@ def _get_ordered_bare_labels(
     if mol is None:
         return None
 
-    # Collect bare-wildcard atom indices and their labels
+    # Collect bare-wildcard atom indices and their labels.
+    # A bare ``*`` in canonical SMILES has atomic_num=0, isotope=0,
+    # formal_charge=0, no explicit Hs, and no atom map.  Any of these
+    # properties would force bracket notation (e.g. ``[*-]``), which
+    # ``_count_bare_stars`` does not count.
     bare_info: Dict[int, str] = {}  # rdkit_idx → label
     for atom in mol.GetAtoms():
-        if atom.GetAtomicNum() == 0 and atom.GetIsotope() == 0:
+        if (atom.GetAtomicNum() == 0
+                and atom.GetIsotope() == 0
+                and atom.GetFormalCharge() == 0
+                and atom.GetNumExplicitHs() == 0
+                and atom.GetAtomMapNum() == 0):
             idx = atom.GetIdx()
             sym = elem_symbols[idx] if idx < len(elem_symbols) else '*'
             label = _clean_element_symbol(sym)
@@ -140,31 +148,30 @@ def _get_ordered_bare_labels(
     if not bare_info:
         return []
 
-    # Assign unique isotopes to determine canonical ordering
-    rw = Chem.RWMol(mol)
-    for idx in bare_info:
-        rw.GetAtomWithIdx(idx).SetIsotope(1000 + idx)
-
+    # Use _smilesAtomOutputOrder to determine canonical ordering.
+    # Unlike the previous isotope-tagging approach, this does NOT modify
+    # the molecule, so the canonical atom traversal order is preserved.
     try:
         Chem.SanitizeMol(
-            rw,
+            mol,
             Chem.SanitizeFlags.SANITIZE_ALL
             ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES,
         )
-        temp_smiles = Chem.MolToSmiles(rw)
+        Chem.MolToSmiles(mol)
+        order_str = mol.GetProp('_smilesAtomOutputOrder')
+        atom_order = [
+            int(x)
+            for x in order_str.strip('[]() ').split(',')
+            if x.strip()
+        ]
     except Exception:
         return None
 
-    # Read isotopes in SMILES order → ordered labels
-    # Only match isotopes >= 1000 (the temporary ones we assigned);
-    # skip pre-existing numbered wildcards like [2*], [3*].
-    ordered: List[str] = []
-    for m in re.finditer(r'\[(\d+)\*\]', temp_smiles):
-        iso = int(m.group(1))
-        if iso < 1000:
-            continue
-        mol_idx = iso - 1000
-        ordered.append(bare_info.get(mol_idx, 'R'))
+    ordered: List[str] = [
+        bare_info[mol_idx]
+        for mol_idx in atom_order
+        if mol_idx in bare_info
+    ]
     return ordered
 
 
