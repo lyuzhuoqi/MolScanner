@@ -412,21 +412,67 @@ def _has_cjk(text: str) -> bool:
     return False
 
 
-_CJK_FONT_DIR = os.path.expanduser('~/.local/share/fonts')
-_CJK_FONT_CACHE = {}
+# CJK font pool — covers common styles found in patents and papers:
+#   Sans (黑体/ゴシック): NotoSansCJK {sc,jp} × {Regular,Bold,Light}
+#   Serif (宋体/明朝体):  NotoSerifCJK {sc,jp} × {Regular,Bold}
+#   Fallback:             DroidSansFallbackFull
+_CJK_FONT_SEARCH_DIRS = [
+    os.path.expanduser('~/.local/share/fonts'),
+    '/usr/share/fonts/truetype/noto',
+    '/usr/share/fonts/opentype/noto',
+    '/usr/share/fonts/truetype/droid',
+]
+_CJK_FONT_CANDIDATES = [
+    # Sans 黑体 / ゴシック体 — patent headings and labels
+    'NotoSansCJKsc-Regular.otf',
+    'NotoSansCJKsc-Bold.otf',
+    'NotoSansCJKsc-Light.otf',
+    'NotoSansCJKjp-Regular.otf',
+    'NotoSansCJKjp-Bold.otf',
+    # Serif 宋体 / 明朝体 — patent body text
+    'NotoSerifCJKsc-Regular.otf',
+    'NotoSerifCJKsc-Bold.otf',
+    'NotoSerifCJKjp-Regular.otf',
+    'NotoSerifCJKjp-Bold.otf',
+    # TTC bundles (if installed via system package)
+    'NotoSansCJK-Regular.ttc',
+    'NotoSansCJK-Medium.ttc',
+    # Fallback
+    'DroidSansFallbackFull.ttf',
+]
 
-def _get_cjk_font(size: int):
-    if size in _CJK_FONT_CACHE:
-        return _CJK_FONT_CACHE[size]
-    for name in ('NotoSansCJK-Regular.ttc', 'NotoSansCJK-Medium.ttc'):
-        path = os.path.join(_CJK_FONT_DIR, name)
-        if os.path.isfile(path):
-            font = ImageFont.truetype(path, size)
-            _CJK_FONT_CACHE[size] = font
-            return font
-    font = ImageFont.load_default()
-    _CJK_FONT_CACHE[size] = font
-    return font
+# Resolved at import time: list of absolute paths that actually exist
+_CJK_FONT_PATHS: list = []
+for _dir in _CJK_FONT_SEARCH_DIRS:
+    for _name in _CJK_FONT_CANDIDATES:
+        _p = os.path.join(_dir, _name)
+        if os.path.isfile(_p) and _p not in _CJK_FONT_PATHS:
+            _CJK_FONT_PATHS.append(_p)
+
+# Cache: keyed by (path, size) to avoid re-loading the same font object
+_CJK_FONT_CACHE: dict = {}
+
+
+def _get_cjk_font(size: int, randomize: bool = True):
+    """Return a CJK-capable PIL font of the given *size*.
+
+    When *randomize* is True (default during training augmentation),
+    a font is chosen uniformly at random from the installed pool so that
+    the model sees a variety of type-faces.  When False, the first
+    available font is returned deterministically.
+    """
+    if not _CJK_FONT_PATHS:
+        return ImageFont.load_default()
+
+    if randomize:
+        path = random.choice(_CJK_FONT_PATHS)
+    else:
+        path = _CJK_FONT_PATHS[0]
+
+    cache_key = (path, size)
+    if cache_key not in _CJK_FONT_CACHE:
+        _CJK_FONT_CACHE[cache_key] = ImageFont.truetype(path, size)
+    return _CJK_FONT_CACHE[cache_key]
 
 
 def _overlay_comment(img: np.ndarray, text: str, font_size: int = 20,

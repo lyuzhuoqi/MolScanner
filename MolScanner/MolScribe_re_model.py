@@ -559,6 +559,56 @@ class CropWhiteTrain(A.DualTransform):
     def get_transform_init_args_names(self):
         return ('value', 'pad')
 
+
+class PadWhite(A.DualTransform):
+    """Randomly pad ONE edge with white space.
+
+    Mimics the original MolScribe PadWhite: pick one of the four sides
+    at random and pad it by up to ``pad_ratio`` of the image dimension.
+    """
+
+    def __init__(self, pad_ratio=0.4, p=0.2, value=(255, 255, 255)):
+        super().__init__(p=p)
+        self.pad_ratio = pad_ratio
+        self.value = value
+
+    @property
+    def targets_as_params(self):
+        return ["image"]
+
+    def get_params_dependent_on_data(self, params, data):
+        img = data["image"]
+        height, width = img.shape[:2]
+        pad_top = pad_bottom = pad_left = pad_right = 0
+        side = random.randrange(4)
+        if side == 0:
+            pad_top = int(height * self.pad_ratio * random.random())
+        elif side == 1:
+            pad_bottom = int(height * self.pad_ratio * random.random())
+        elif side == 2:
+            pad_left = int(width * self.pad_ratio * random.random())
+        elif side == 3:
+            pad_right = int(width * self.pad_ratio * random.random())
+        return {"pad_top": pad_top, "pad_bottom": pad_bottom,
+                "pad_left": pad_left, "pad_right": pad_right}
+
+    def apply(self, img, pad_top=0, pad_bottom=0, pad_left=0, pad_right=0, **params):
+        return cv2.copyMakeBorder(
+            img, pad_top, pad_bottom, pad_left, pad_right,
+            cv2.BORDER_CONSTANT, value=self.value)
+
+    def apply_to_keypoints(
+        self, keypoints: np.ndarray,
+        pad_top=0, pad_bottom=0, pad_left=0, pad_right=0, **params,
+    ) -> np.ndarray:
+        result = keypoints.copy()
+        result[:, 0] = result[:, 0] + pad_left
+        result[:, 1] = result[:, 1] + pad_top
+        return result
+
+    def get_transform_init_args_names(self):
+        return ('value', 'pad_ratio')
+
 # ======================== Dataset ========================
 
 class PadToSquare:
@@ -647,7 +697,7 @@ class MoleculeDataset(Dataset):
                 A.Affine(rotate=(-90, 90), fit_output=True, fill=255, p=0.5),
                 CropWhiteTrain(pad=5, p=1.0),  # Trim white corners from rotation before further augmentation
                 A.RandomCropFromBorders(crop_left=0.01, crop_right=0.01, crop_top=0.01, crop_bottom=0.01, p=0.5),
-                A.CropAndPad(percent=(0.0, 0.4), sample_independently=True, keep_size=False, fill=255, fill_mask=255, p=0.2),
+                PadWhite(pad_ratio=0.4, p=0.2),
             ]
         self.geo_transforms = A.Compose(self.geo_transforms_list, 
                                         keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
@@ -655,7 +705,7 @@ class MoleculeDataset(Dataset):
         self.img_transforms_list = []
         if self.img_augment:
             self.img_transforms_list += [
-                A.Downscale(scale_range=(0.5, 0.8), interpolation_pair={'upscale': 3, 'downscale': 3}),
+                A.Downscale(scale_range=(0.2, 0.5), interpolation_pair={'upscale': 3, 'downscale': 3}),
                 A.Blur(),
                 A.GaussNoise(),
                 A.SaltAndPepper(),
