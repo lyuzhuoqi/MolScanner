@@ -3,6 +3,7 @@ from indigo.renderer import IndigoRenderer
 
 import random
 import os
+import glob
 from typing import Dict, Any
 import numpy as np
 import string
@@ -440,17 +441,40 @@ _CJK_FONT_CANDIDATES = [
     # Fallback
     'DroidSansFallbackFull.ttf',
 ]
+_CJK_FONT_GLOB_CANDIDATES = [
+    'NotoSansCJK-*.ttc',
+    'NotoSerifCJK-*.ttc',
+    'DroidSansFallback*.ttf',
+]
+
+
+def _discover_cjk_font_paths() -> list:
+    paths = []
+    for font_dir in _CJK_FONT_SEARCH_DIRS:
+        if not os.path.isdir(font_dir):
+            continue
+        for name in _CJK_FONT_CANDIDATES:
+            path = os.path.join(font_dir, name)
+            if os.path.isfile(path) and path not in paths:
+                paths.append(path)
+        for pattern in _CJK_FONT_GLOB_CANDIDATES:
+            for path in sorted(glob.glob(os.path.join(font_dir, pattern))):
+                if os.path.isfile(path) and path not in paths:
+                    paths.append(path)
+    return paths
+
+
+def _log_cjk_font_status() -> None:
+    count = len(_CJK_FONT_PATHS)
+    print(f'[drawing_engine] discovered {count} CJK font files')
 
 # Resolved at import time: list of absolute paths that actually exist
-_CJK_FONT_PATHS: list = []
-for _dir in _CJK_FONT_SEARCH_DIRS:
-    for _name in _CJK_FONT_CANDIDATES:
-        _p = os.path.join(_dir, _name)
-        if os.path.isfile(_p) and _p not in _CJK_FONT_PATHS:
-            _CJK_FONT_PATHS.append(_p)
+_CJK_FONT_PATHS: list = _discover_cjk_font_paths()
+_log_cjk_font_status()
 
 # Cache: keyed by (path, size) to avoid re-loading the same font object
 _CJK_FONT_CACHE: dict = {}
+_CJK_FONT_FAILED_PATHS: set = set()
 
 
 def _get_cjk_font(size: int, randomize: bool = True):
@@ -464,15 +488,24 @@ def _get_cjk_font(size: int, randomize: bool = True):
     if not _CJK_FONT_PATHS:
         return ImageFont.load_default()
 
-    if randomize:
-        path = random.choice(_CJK_FONT_PATHS)
-    else:
-        path = _CJK_FONT_PATHS[0]
+    candidates = [path for path in _CJK_FONT_PATHS if path not in _CJK_FONT_FAILED_PATHS]
+    if not candidates:
+        return ImageFont.load_default()
 
-    cache_key = (path, size)
-    if cache_key not in _CJK_FONT_CACHE:
-        _CJK_FONT_CACHE[cache_key] = ImageFont.truetype(path, size)
-    return _CJK_FONT_CACHE[cache_key]
+    if randomize:
+        random.shuffle(candidates)
+
+    for path in candidates:
+        cache_key = (path, size)
+        if cache_key in _CJK_FONT_CACHE:
+            return _CJK_FONT_CACHE[cache_key]
+        try:
+            _CJK_FONT_CACHE[cache_key] = ImageFont.truetype(path, size)
+            return _CJK_FONT_CACHE[cache_key]
+        except OSError:
+            _CJK_FONT_FAILED_PATHS.add(path)
+
+    return ImageFont.load_default()
 
 
 def _overlay_comment(img: np.ndarray, text: str, font_size: int = 20,
@@ -483,16 +516,16 @@ def _overlay_comment(img: np.ndarray, text: str, font_size: int = 20,
     font = _get_cjk_font(font_size)
     bbox = font.getbbox(text)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    pad = offset + th + 6
-    w = max(pil_img.width, tw + 10)
+    pad = int(offset + th + 6)
+    w = int(max(pil_img.width, tw + 10))
     if position == 'top':
         new_img = Image.new('RGB', (w, pil_img.height + pad), (255, 255, 255))
         new_img.paste(pil_img, ((w - pil_img.width) // 2, pad))
-        ty = offset + 2
+        ty = int(offset + 2)
     else:
         new_img = Image.new('RGB', (w, pil_img.height + pad), (255, 255, 255))
         new_img.paste(pil_img, ((w - pil_img.width) // 2, 0))
-        ty = pil_img.height + offset
+        ty = int(pil_img.height + offset)
     tx = int((w - tw) * alignment)
     draw = ImageDraw.Draw(new_img)
     draw.text((tx, ty), text, fill=(0, 0, 0), font=font)
