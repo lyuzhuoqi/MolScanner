@@ -3,7 +3,7 @@ Stage 2: Real-Image RL Finetuning on 82K MolParser Data
 ========================================================
 
 Pure cycle-consistency RL finetuning on real-world molecule images.
-No MLE loss — only REINFORCE with visual reward:
+No MLE loss — only MRT with visual reward:
     pred SMILES → render → encode → cosine_sim(features_orig, features_rendered)
 
 Continues from the Stage 1 (1M+680K joint) checkpoint.
@@ -40,14 +40,14 @@ if __name__ == '__main__':
                              '(default: models/MolScribe_re_1M680K/best.pth)')
     parser.add_argument('--fast_test', action='store_true',
                         help='Quick smoke-test with tiny data')
-    parser.add_argument('--rl_method', type=str, default='reinforce',
-                        choices=['reinforce', 'mrt'],
-                        help='RL method: reinforce or mrt')
     parser.add_argument('--mrt_alpha', type=float, default=1.0,
                         help='MRT alpha (sharpening exponent)')
     parser.add_argument('--reward_mode', type=str, default='visual',
                         choices=['visual', 'tanimoto', 'edit_distance'],
                         help='Reward similarity mode')
+    parser.add_argument('--visual_reward_renderer', type=str, default='rdkit',
+                        choices=['rdkit', 'drawing_engine'],
+                        help='Renderer backend for visual reward images')
     parser.add_argument('--gpu', type=str, default='0',
                         help='Comma-separated GPU ids (default: "0")')
     parser.add_argument('--val_benchmarks', type=str, nargs='+',
@@ -148,9 +148,8 @@ if __name__ == '__main__':
         reward_similarity_weight=0.5,
         reward_exact_match_weight=0.4,
         reward_mode=args.reward_mode,
+        visual_reward_renderer=args.visual_reward_renderer,
 
-        # RL method
-        rl_method=args.rl_method,
         mrt_alpha=args.mrt_alpha,
 
         # External visual reward encoder
