@@ -464,13 +464,10 @@ def _discover_cjk_font_paths() -> list:
     return paths
 
 
-def _log_cjk_font_status() -> None:
-    count = len(_CJK_FONT_PATHS)
-    print(f'[drawing_engine] discovered {count} CJK font files')
-
 # Resolved at import time: list of absolute paths that actually exist
 _CJK_FONT_PATHS: list = _discover_cjk_font_paths()
-_log_cjk_font_status()
+if not _CJK_FONT_PATHS:
+    print('[drawing_engine] WARNING: no CJK font files found, will fall back to default font')
 
 # Cache: keyed by (path, size) to avoid re-loading the same font object
 _CJK_FONT_CACHE: dict = {}
