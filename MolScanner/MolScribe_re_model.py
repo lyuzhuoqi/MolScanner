@@ -67,6 +67,9 @@ import drawing_engine as _drawing_engine  # module-level for autoreload compatib
 def generate_image_from_smiles(*args, **kwargs):
     return _drawing_engine.generate_image_from_smiles(*args, **kwargs)
 
+def generate_image_from_wild_smiles(*args, **kwargs):
+    return _drawing_engine.generate_image_from_wild_smiles(*args, **kwargs)
+
 def _blank_image(*args, **kwargs):
     return _drawing_engine._blank_image(*args, **kwargs)
 from chemistry import (
@@ -2593,6 +2596,26 @@ def compute_tanimoto_similarity(smiles1: str, smiles2: str) -> float:
     except Exception:
         return 0.0
 
+
+def _prepare_smiles_for_tanimoto(smiles: str) -> str:
+    """Convert a possibly-illegal wild SMILES into canonical legal SMILES for Tanimoto.
+
+    Returns empty string on failure.
+    """
+    try:
+        s = remove_atom_mapping(smiles)
+        s, mappings = _replace_functional_group(s)
+        mol = Chem.MolFromSmiles(s, sanitize=False)
+        if mol is None:
+            return ''
+        s, mol = _expand_functional_group(mol, mappings)
+        canon, ok = canonicalize_smiles(s, ignore_cistrans=True)
+        if ok and canon:
+            return canon
+        return ''
+    except Exception:
+        return ''
+
 def remove_atom_mapping(smiles: str) -> str:
     """Remove atom mapping numbers from SMILES."""
     try:
@@ -2639,7 +2662,7 @@ def _result_to_smiles_decoder(result: Dict) -> Optional[str]:
         if not smiles:
             return None
         can_smi, ok = canonicalize_smiles(smiles, ignore_cistrans=True)
-        return can_smi if ok and can_smi else None
+        return can_smi if can_smi else None
     except Exception:
         return None
 
@@ -3746,17 +3769,19 @@ def _drawing_engine_render_smiles(smiles: str) -> Tuple[np.ndarray, bool]:
     to keep reward variance low while staying closer to the
     MolDiscriminator training domain.
     """
+    if not isinstance(smiles, str) or len(smiles) == 0:
+        return _blank_image(), False
+
     try:
-        img, _, _, success, _, _ = generate_image_from_smiles(
+        img, _, _, success, _, _ = generate_image_from_wild_smiles(
             smiles,
-            mol_augment=False,
             default_drawing_style=True,
             debug=False,
         )
         if not success:
             return _blank_image(), False
         return img, True
-    except Exception:
+    except (FunctionTimedOut, Exception):
         return _blank_image(), False
 
 
@@ -3912,54 +3937,60 @@ def compute_mrt_loss(
         )
 
     # ===== Phase 2: Compute rewards → costs (non-differentiable) =====
+    # Canonicalize GT SMILES for validity and similarity metrics
     gt_canonical = []
     for s in gt_expanded:
-        try:
-            s_clean = remove_atom_mapping(s)
-            s_clean, mappings = _replace_functional_group(s_clean)
-            mol_tmp = Chem.MolFromSmiles(s_clean, sanitize=False)
-            if mol_tmp is not None:
-                s_clean, mol_tmp = _expand_functional_group(mol_tmp, mappings)
-            can, ok = canonicalize_smiles(s_clean, ignore_cistrans=True)
-            gt_canonical.append(can if ok and can else s)
-        except Exception:
-            gt_canonical.append(s)
+        gt_canonical.append(canonicalize_smiles(s, ignore_cistrans=True)[0])
 
     # Extract predicted SMILES (with bond prediction + postprocess)
+    # sampled_smiles = []
+    # with torch.no_grad():
+    #     for b in range(total_seqs):
+    #         result = vocab.sequence_to_smiles(sampled_seqs_list[b])
+    #         try:
+    #             seq_tensor = torch.tensor([sampled_seqs_list[b]], dtype=torch.long, device=device)
+    #             atom_idx, atom_cnt = extract_atom_indices_from_tokens(seq_tensor, vocab)
+    #             a_mask = torch.arange(atom_idx.size(1), device=device) < atom_cnt.unsqueeze(1)
+    #             feat_b = img_features_expanded[b:b+1]
+    #             hidden, _ = model.sequence_decoder(feat_b, seq_tensor)
+    #             e_logits = model.bond_predictor(hidden, atom_idx, a_mask)
+    #             result['bond_mat'] = _symmetrize_edge_predictions(e_logits[0])
+    #         except Exception:
+    #             pass
+    #         pred_smiles = _result_to_smiles_postprocess(result)
+    #         if pred_smiles is None:
+    #             pred_smiles = ''
+    #         sampled_smiles.append(pred_smiles)
+
+    # Extract raw decoder SMILES
     sampled_smiles = []
     with torch.no_grad():
         for b in range(total_seqs):
             result = vocab.sequence_to_smiles(sampled_seqs_list[b])
-            try:
-                seq_tensor = torch.tensor([sampled_seqs_list[b]], dtype=torch.long, device=device)
-                atom_idx, atom_cnt = extract_atom_indices_from_tokens(seq_tensor, vocab)
-                a_mask = torch.arange(atom_idx.size(1), device=device) < atom_cnt.unsqueeze(1)
-                feat_b = img_features_expanded[b:b+1]
-                hidden, _ = model.sequence_decoder(feat_b, seq_tensor)
-                e_logits = model.bond_predictor(hidden, atom_idx, a_mask)
-                result['bond_mat'] = _symmetrize_edge_predictions(e_logits[0])
-            except Exception:
-                pass
-            pred_smiles = _result_to_smiles_postprocess(result)
-            if pred_smiles is None:
-                pred_smiles = ''
-            sampled_smiles.append(pred_smiles)
+            sampled_smiles.append(result['smiles'])
+
+    # Canonicalize sampled SMILES for validity and similarity metrics
+    sampled_smiles_canonical = []
+    is_valid_list = []
+    n_valid_smiles = 0
+    for s in sampled_smiles:
+        can, is_valid = canonicalize_smiles(s, ignore_cistrans=True)
+        sampled_smiles_canonical.append(can)
+        is_valid_list.append(is_valid)
+        if is_valid:
+            n_valid_smiles += 1
 
     if device.type == 'cuda':
         torch.cuda.empty_cache()
 
     # Per-sample validity and exact match
-    is_valid_list = []
     is_exact_list = []
-    n_valid_smiles = 0
+
     n_exact = 0
     for b in range(total_seqs):
-        is_valid = sampled_smiles[b] != '' and Chem.MolFromSmiles(sampled_smiles[b]) is not None
-        is_exact = sampled_smiles[b] != '' and sampled_smiles[b] == gt_canonical[b]
-        is_valid_list.append(is_valid)
+        # Use canonicalized SMILES for exact match to avoid penalizing minor token reordering that doesn't affect the molecule.
+        is_exact = sampled_smiles_canonical[b] != '' and sampled_smiles_canonical[b] == gt_canonical[b]
         is_exact_list.append(is_exact)
-        if is_valid:
-            n_valid_smiles += 1
         if is_exact:
             n_exact += 1
 
@@ -3969,8 +4000,27 @@ def compute_mrt_loss(
     extra_info: Dict = {}
 
     if reward_mode == 'tanimoto':
+        # Tominoto similarity is based on fingerprints, so SMILES strings must be legal. 
+        gt_tanimoto = [_prepare_smiles_for_tanimoto(s) for s in gt_expanded]
+        pred_tanimoto = [_prepare_smiles_for_tanimoto(s) for s in sampled_smiles]
+
+        is_valid_list = []
+        is_exact_list = []
+        n_valid_smiles = 0
+        n_exact = 0
         for b in range(total_seqs):
-            tanimoto = compute_tanimoto_similarity(sampled_smiles[b], gt_canonical[b])
+            is_valid = pred_tanimoto[b] != ''
+            is_exact = (is_valid and gt_tanimoto[b] != ''
+                        and pred_tanimoto[b] == gt_tanimoto[b])
+            is_valid_list.append(is_valid)
+            is_exact_list.append(is_exact)
+            if is_valid:
+                n_valid_smiles += 1
+            if is_exact:
+                n_exact += 1
+
+        for b in range(total_seqs):
+            tanimoto = compute_tanimoto_similarity(pred_tanimoto[b], gt_tanimoto[b])
             r = (reward_validity_weight * float(is_valid_list[b])
                  + reward_similarity_weight * tanimoto
                  + reward_exact_match_weight * float(is_exact_list[b]))
@@ -3980,7 +4030,8 @@ def compute_mrt_loss(
 
     elif reward_mode == 'edit_distance':
         for b in range(total_seqs):
-            edit_sim = _levenshtein_similarity(sampled_smiles[b], gt_canonical[b])
+            # Canonicalize to make sure that the order of tokens is consistent.
+            edit_sim = _levenshtein_similarity(sampled_smiles_canonical[b], gt_canonical[b])
             r = (reward_validity_weight * float(is_valid_list[b])
                  + reward_similarity_weight * edit_sim
                  + reward_exact_match_weight * float(is_exact_list[b]))
@@ -3993,13 +4044,15 @@ def compute_mrt_loss(
         _encode_chunk = 32
 
         gt_rendered_np = []
-        for smi in gt_canonical:
+        # No need to canonicalize GT SMILES for visual reward.
+        for smi in gt_expanded:
             img_np, _ = _render_smiles_for_visual_reward(smi, visual_reward_renderer)
             gt_rendered_np.append(img_np)
 
         pred_rendered_np = []
         pred_render_ok = []
         render_success_count = 0
+         # No need to canonicalize GT SMILES for visual reward.
         for smi in sampled_smiles:
             img_np, ok = _render_smiles_for_visual_reward(smi, visual_reward_renderer)
             pred_rendered_np.append(img_np)
@@ -4097,16 +4150,11 @@ def compute_mrt_loss(
     # Weighted average cost per image, then mean over batch
     mrt_loss = (weights * costs_grouped).sum(dim=1).mean()
 
-    # Diagnostics
-    n_valid = sum(1 for b in range(total_seqs)
-                  if rewards[b].item() > reward_validity_weight + 1e-6)
-
     info = {
         'mean_reward': rewards.mean().item(),
         'mean_cost': costs.mean().item(),
         'mean_log_prob': seq_log_probs.mean().item(),
         'sampled_smiles': sampled_smiles[:B],
-        'n_valid': n_valid,
         'mean_similarity': similarity_sum / max(total_seqs, 1),
         'exact_matches': n_exact,
         'valid_smiles_count': n_valid_smiles,

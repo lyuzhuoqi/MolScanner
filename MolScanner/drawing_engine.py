@@ -782,6 +782,107 @@ def generate_image_from_smiles(smiles, n_bins=None,
 
     return img, smiles, graph, success, style_config, mol_config
 
+
+@func_set_timeout(5)  # Set timeout of 5 seconds
+def generate_image_from_wild_smiles(smiles, n_bins=None,
+                                      default_drawing_style=True,
+                                      debug=False):
+    """
+    Generate molecule image and graph from an Indigo-parsable SMILES-like string,
+    including strings that may be illegal for RDKit (e.g. containing custom
+    superatom labels such as ``[RuCmG]``).
+
+    Unlike ``generate_image_from_smiles``, this function does NOT perform
+    abbreviation/functional-group lookup or expansion. Labels are kept as-is and
+    rendered as single superatoms by Indigo.
+
+    Args:
+        smiles: Indigo-parsable SMILES-like string
+        n_bins: int or None, number of bins for coordinate binning
+        default_drawing_style: bool, whether to use default drawing style
+        debug: If True, raise exceptions instead of returning fallback
+
+    Returns:
+        img: np.ndarray (H, W, 3) Color image
+        smiles: input SMILES-like string (kept as-is)
+        graph: dict with 'symbols', 'edges', 'coords'
+        success: bool, whether the generation was successful
+        style_config: dict, drawing style configuration used
+        mol_config: dict, molecule configuration used
+    """
+    def _replace_invalid_bracket_atoms(raw_smiles: str):
+        """Replace non-RDKit bracket atoms with mapped wildcards [*:N]."""
+        bracket_re = re.compile(r'\[[^\[\]]+\]')
+        alias_by_mapnum = {}
+        next_map = 1001
+
+        def _repl(match):
+            nonlocal next_map
+            token = match.group(0)
+            atom = Chem.MolFromSmiles(token, sanitize=False)
+            if atom is not None:
+                return token
+            label = token[1:-1].strip()
+            map_num = next_map
+            next_map += 1
+            alias_by_mapnum[map_num] = label
+            return f'[*:{map_num}]'
+
+        replaced = bracket_re.sub(_repl, raw_smiles)
+        return replaced, alias_by_mapnum
+
+    def _load_wild_molecule(indigo_obj, raw_smiles: str):
+        """Load molecule while preserving wild labels as superatom aliases."""
+        replaced_smiles, alias_by_mapnum = _replace_invalid_bracket_atoms(raw_smiles)
+
+        if not alias_by_mapnum:
+            return indigo_obj.loadMolecule(raw_smiles)
+
+        rd_mol = Chem.MolFromSmiles(replaced_smiles, sanitize=False)
+        if rd_mol is None:
+            return indigo_obj.loadMolecule(raw_smiles)
+
+        for atom in rd_mol.GetAtoms():
+            map_num = atom.GetAtomMapNum()
+            if map_num in alias_by_mapnum:
+                alias = alias_by_mapnum[map_num]
+                atom.SetAtomMapNum(0)
+                atom.SetProp('molFileAlias', alias)
+
+        return indigo_obj.loadMolecule(Chem.MolToMolBlock(rd_mol))
+
+    indigo = None
+    renderer = None
+    style_config, mol_config = None, None
+
+    try:
+        indigo = Indigo()
+        renderer = IndigoRenderer(indigo)
+
+        mol = _load_wild_molecule(indigo, smiles)
+
+        mol, style_config, mol_config = _generate_style_config(
+            mol, default_drawing_style)
+        _apply_style_config(indigo, style_config, mol, mol_config)
+
+        mol.layout()
+        buf = renderer.renderToBuffer(mol)
+        img = cv2.imdecode(np.asarray(bytearray(buf), dtype=np.uint8), 1)
+        if style_config and 'comment_overlay' in mol_config:
+            co = mol_config['comment_overlay']
+            img = _overlay_comment(img, **co)
+
+        graph = get_graph(mol, img, n_bins=n_bins)
+        success = True
+    except Exception:
+        if debug:
+            raise
+        img = _blank_image()
+        graph = {}
+        success = False
+
+    return img, smiles, graph, success, style_config, mol_config
+
 @func_set_timeout(5)  # Set timeout of 5 seconds
 def generate_image_from_graph(graph,
                               style_config=None, mol_config=None, default_drawing_style=True,
