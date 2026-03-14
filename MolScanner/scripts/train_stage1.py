@@ -174,7 +174,6 @@ if __name__ == '__main__':
         num_workers=4 if FAST_TEST else 8,
         seed=2026,
         use_amp=True,
-        force_cpu=False,
 
         # molecular
         mol_augment=True,

@@ -27,7 +27,7 @@ import argparse
 project_dir = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(project_dir / "MolScanner"))
 
-from MolScribe_re_model import train_rl_real_finetune
+from MolScribe_re_model import train_rl_finetune
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Real-image RL finetuning')
@@ -100,7 +100,7 @@ if __name__ == '__main__':
     # ===== Fast Test Mode =====
     FAST_TEST = args.fast_test
 
-    train_rl_real_finetune(
+    train_rl_finetune(
         # data
         train_csv_paths=train_csv_paths,
         train_image_dirs=train_image_dirs,
@@ -125,7 +125,7 @@ if __name__ == '__main__':
 
         # training
         num_epochs=2 if FAST_TEST else 10,
-        batch_size=8 if FAST_TEST else 32,
+        batch_size=4 if FAST_TEST else 32,
         encoder_lr=1e-5,
         decoder_lr=1e-5,
         weight_decay=1e-6,
@@ -134,13 +134,11 @@ if __name__ == '__main__':
         early_stopping_patience=10,
         num_workers=2 if FAST_TEST else 4,
         use_amp=True,
-        force_cpu=False,
 
         # RL
         rl_max_len=500,
         rl_temperature=0.8,
         rl_n_samples=16,
-        rl_subsample=16,
 
         # Reward weights:
         # R = w_v·𝟙[valid] + w_sim·cosine_sim(render(pred), orig) + w_e·𝟙[exact]

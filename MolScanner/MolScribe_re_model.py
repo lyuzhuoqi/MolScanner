@@ -2035,7 +2035,7 @@ class MolScribeModel(nn.Module):
 
     def _apply_constraints(self, logits: torch.Tensor, last_token: int) -> torch.Tensor:
         """Apply structural constraints for chartok_coords format.
-        
+
         Rules:
           - After X_BIN  → only Y_BIN is allowed
           - After Y_BIN  → SMILES chars + EOS (no coords)
@@ -2044,31 +2044,99 @@ class MolScribeModel(nn.Module):
         """
         logits = logits.clone()
         vocab = self.vocab
-        
+
         is_last_x_bin = vocab.is_x_coord_token(last_token)
         is_last_y_bin = vocab.is_y_coord_token(last_token)
-        
+
         if is_last_x_bin:
             # After X_BIN → only Y_BIN allowed
             mask = torch.ones_like(logits, dtype=torch.bool)
             mask[vocab.y_bin_start_idx:vocab.y_bin_end_idx + 1] = False
             logits.masked_fill_(mask, float('-inf'))
-            
+
         elif is_last_y_bin:
             # After Y_BIN → SMILES chars + EOS; no coords
             logits[vocab.x_bin_start_idx:vocab.y_bin_end_idx + 1] = float('-inf')
             logits[[vocab.pad_idx, vocab.sos_idx, vocab.unk_idx]] = float('-inf')
-            
+
         elif last_token == vocab.sos_idx:
             # After SOS → SMILES chars only (no coords, no EOS)
             logits[vocab.x_bin_start_idx:vocab.y_bin_end_idx + 1] = float('-inf')
             logits[[vocab.pad_idx, vocab.sos_idx, vocab.eos_idx, vocab.unk_idx]] = float('-inf')
-            
+
         else:
             # After a SMILES char → allow SMILES chars + X_BIN + EOS; no Y_BIN
             logits[vocab.y_bin_start_idx:vocab.y_bin_end_idx + 1] = float('-inf')
             logits[[vocab.pad_idx, vocab.sos_idx, vocab.unk_idx]] = float('-inf')
-            
+
+        return logits
+
+    def _apply_constraints_batch(self, logits: torch.Tensor,
+                                 last_tokens: torch.Tensor,
+                                 finished: torch.Tensor) -> torch.Tensor:
+        """Vectorised chartok_coords constraints for a whole batch.
+
+        Applies the same four rules as :meth:`_apply_constraints` but
+        operates on the full ``[B, V]`` logits tensor at once using
+        boolean index masking.  This avoids the per-sample ``.item()``
+        calls that would otherwise force a GPU→CPU sync at **every**
+        decoding step for **every** sequence.
+
+        Args:
+            logits: ``[B, V]`` raw logits from the decoder step.
+            last_tokens: ``[B]`` previous token ids (on GPU).
+            finished: ``[B]`` bool mask; True for sequences that have
+                already emitted EOS (their logits are left untouched).
+
+        Returns:
+            ``[B, V]`` logits with disallowed positions set to ``-inf``.
+        """
+        vocab = self.vocab
+        B, V = logits.shape
+
+        NEG_INF = float('-inf')
+
+        # Classify each sequence's last token into one of four categories [B]
+        is_x = (last_tokens >= vocab.x_bin_start_idx) & (last_tokens <= vocab.x_bin_end_idx)
+        is_y = (last_tokens >= vocab.y_bin_start_idx) & (last_tokens <= vocab.y_bin_end_idx)
+        is_sos = (last_tokens == vocab.sos_idx)
+        is_char = ~is_x & ~is_y & ~is_sos & ~finished
+
+        # ------ After X_BIN → only Y_BIN allowed ------
+        if is_x.any():
+            # Mask: everything except Y_BIN range
+            x_mask = torch.ones(V, dtype=torch.bool, device=logits.device)
+            x_mask[vocab.y_bin_start_idx:vocab.y_bin_end_idx + 1] = False
+            logits[is_x] = logits[is_x].masked_fill(x_mask.unsqueeze(0), NEG_INF)
+
+        # ------ After Y_BIN → no coords, no PAD/SOS/UNK ------
+        if is_y.any():
+            y_mask = torch.zeros(V, dtype=torch.bool, device=logits.device)
+            y_mask[vocab.x_bin_start_idx:vocab.y_bin_end_idx + 1] = True
+            y_mask[vocab.pad_idx] = True
+            y_mask[vocab.sos_idx] = True
+            y_mask[vocab.unk_idx] = True
+            logits[is_y] = logits[is_y].masked_fill(y_mask.unsqueeze(0), NEG_INF)
+
+        # ------ After SOS → no coords, no PAD/SOS/EOS/UNK ------
+        if is_sos.any():
+            sos_mask = torch.zeros(V, dtype=torch.bool, device=logits.device)
+            sos_mask[vocab.x_bin_start_idx:vocab.y_bin_end_idx + 1] = True
+            sos_mask[vocab.pad_idx] = True
+            sos_mask[vocab.sos_idx] = True
+            sos_mask[vocab.eos_idx] = True
+            sos_mask[vocab.unk_idx] = True
+            logits[is_sos] = logits[is_sos].masked_fill(sos_mask.unsqueeze(0), NEG_INF)
+
+        # ------ After SMILES char → no Y_BIN, no PAD/SOS/UNK ------
+        if is_char.any():
+            char_mask = torch.zeros(V, dtype=torch.bool, device=logits.device)
+            char_mask[vocab.y_bin_start_idx:vocab.y_bin_end_idx + 1] = True
+            char_mask[vocab.pad_idx] = True
+            char_mask[vocab.sos_idx] = True
+            char_mask[vocab.unk_idx] = True
+            logits[is_char] = logits[is_char].masked_fill(char_mask.unsqueeze(0), NEG_INF)
+
         return logits
 
     def _greedy_decode(self, feat: torch.Tensor, max_len: int, device: torch.device) -> List[int]:
@@ -2158,8 +2226,12 @@ class MolScribeModel(nn.Module):
         """Batched greedy decoding with KV-cached Transformer steps.
 
         Uses :meth:`SequenceDecoder.forward_step_cached` so that each step
-        only processes the **new token** (O(T) per step, O(T²) total) instead
-        of re-encoding the full growing sequence (O(T²) per step, O(T³) total).
+        only processes the **new token** — O(T) per step, O(T²) total —
+        instead of re-encoding the full growing sequence.
+
+        Structural constraints (chartok_coords format) are applied via
+        :meth:`_apply_constraints_batch`, which operates on the entire
+        ``[B, V]`` logits tensor per step with no CPU↔GPU sync.
         """
         B = feats.size(0)
         vocab = self.vocab
@@ -2180,10 +2252,9 @@ class MolScribeModel(nn.Module):
                 memory, tokens, step, cache
             )  # logits: [B, vocab_size]
 
-            # Apply per-sequence constraints (cheap CPU ops)
-            for b in range(B):
-                if not finished[b]:
-                    logits[b] = self._apply_constraints(logits[b], seqs[b, -1].item())
+            # Batched structural constraints (fully on GPU, no .item() calls)
+            last_tokens = seqs[:, -1]
+            logits = self._apply_constraints_batch(logits, last_tokens, finished)
 
             tokens = torch.argmax(logits, dim=-1)  # [B]
 
@@ -2218,17 +2289,21 @@ class MolScribeModel(nn.Module):
         """Batched multinomial sampling with KV-cached decoding.
 
         Mirrors :meth:`_greedy_decode_batch` but uses temperature-scaled
-        multinomial sampling instead of argmax, and replaces the O(T²)-per-
-        step full-sequence forward with the O(T)-per-step KV-cached
-        :meth:`SequenceDecoder.forward_step_cached`.
+        multinomial sampling instead of argmax.  Uses KV-cached single-token
+        steps — O(T) per step, O(T²) total — instead of re-encoding the
+        full growing sequence each time.
+
+        Structural constraints (chartok_coords format) are applied via
+        :meth:`_apply_constraints_batch`, which operates on the entire
+        ``[B, V]`` logits tensor per step with no CPU↔GPU sync.
 
         Intended for the RL sampling phase (called under ``torch.no_grad()``).
 
         Args:
             feats: ``[B, d_model, H, W]`` encoded image features.
-            max_len: maximum decoding length.
-            device: compute device.
-            temperature: softmax temperature (>1 → more exploration).
+            max_len: Maximum decoding length.
+            device: Compute device.
+            temperature: Softmax temperature (>1 → more exploration).
 
         Returns:
             List of token-id lists (length B), each starting with SOS and
@@ -2253,12 +2328,9 @@ class MolScribeModel(nn.Module):
                 memory, tokens, step, cache
             )  # logits: [B, vocab_size]
 
-            # Per-sequence structural constraints (cheap CPU ops)
-            for b in range(B):
-                if not finished[b]:
-                    logits[b] = self._apply_constraints(
-                        logits[b], seqs[b, -1].item()
-                    )
+            # Batched structural constraints (fully on GPU, no .item() calls)
+            last_tokens = seqs[:, -1]
+            logits = self._apply_constraints_batch(logits, last_tokens, finished)
 
             # Temperature-scaled multinomial sampling
             probs = F.softmax(logits / temperature, dim=-1)
@@ -3125,7 +3197,6 @@ def train(
         num_workers: int = 4,
         use_amp: bool = True,
         use_gradient_checkpointing: bool = False,
-        force_cpu: bool = False,
         # ===== resume from checkpoint =====
         resume_from: Optional[str] = None,
         # ===== fine-tune from pretrained weights (model only, fresh optimizer) =====
@@ -3158,17 +3229,13 @@ def train(
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get('WORLD_SIZE', 1))
     
-    if force_cpu or not torch.cuda.is_available():
-        device = torch.device('cpu')
-        use_amp = False
-        if is_main_process():
-            print('Forcing CPU mode')
-    else:
-        # Initialize DDP
-        if world_size > 1:
-            setup_ddp(local_rank, world_size)
-        device = torch.device(f'cuda:{local_rank}')
-        torch.cuda.set_device(device)
+    if not torch.cuda.is_available():
+        raise RuntimeError('CUDA is required for training')
+    # Initialize DDP
+    if world_size > 1:
+        setup_ddp(local_rank, world_size)
+    device = torch.device(f'cuda:{local_rank}')
+    torch.cuda.set_device(device)
     
     if is_main_process():
         if world_size > 1:
@@ -3885,6 +3952,7 @@ def compute_mrt_loss(
     visual_reward_transforms: Optional[A.Compose] = None,
     visual_reward_pad_to_square: Optional[object] = None,
     visual_reward_renderer: str = 'rdkit',
+    use_amp: bool = False,
 ) -> Tuple[torch.Tensor, Dict]:
     """Minimum Risk Training (MRT) loss for molecule image recognition.
 
@@ -3900,34 +3968,62 @@ def compute_mrt_loss(
       - Bounded gradients from softmax normalization → lower variance.
       - No baseline needed.
 
+    Pipeline (four phases):
+      1. **Sample** — generate N candidate SMILES per image via batched
+         multinomial decoding (no grad, KV-cached).
+      2. **Reward** — score each candidate against the GT.
+         Canonicalization and rendering run in parallel via ThreadPoolExecutor.
+         In ``'visual'`` mode, GT images are rendered/encoded only once for
+         the B unique originals (not B×N duplicates) and then expanded.
+      3. **Teacher-forced forward** — compute log p(y_i | x) for each
+         candidate with a full decoder pass (differentiable). Runs under
+         AMP fp16 when ``use_amp=True``; logits are cast to fp32 before
+         log-softmax for numerical stability.
+      4. **MRT loss** — softmax-weighted cost, mean over batch.
+
     Args:
         model: MolScribeModel (unwrapped, not DDP).
-        img_features: [B, d_model, H, W] with computation graph.
-        gt_smiles_list: Ground truth SMILES, length B.
-        vocab: MolScannerVocab.
-        device: Compute device.
-        max_len: Max autoregressive decode length.
-        temperature: Sampling temperature for candidates.
-        n_samples: Candidates per image (≥ 2).
-        mrt_alpha: Softmax sharpness over candidate log-probs.
-        reward_validity_weight: Weight for valid-SMILES indicator.
-        reward_similarity_weight: Weight for main similarity signal.
-        reward_exact_match_weight: Weight for exact-match indicator.
+        img_features: ``[B, d_model, H, W]`` encoded image features with
+            computation graph attached (gradients flow back through here).
+        gt_smiles_list: Ground-truth SMILES strings, length B.
+        vocab: MolScannerVocab for tokenisation / detokenisation.
+        device: Compute device (must be CUDA when ``use_amp=True``).
+        max_len: Max autoregressive decode length for candidate sampling.
+        temperature: Sampling temperature (>1 → more exploration).
+        n_samples: Candidates sampled per image (N ≥ 2).
+        mrt_alpha: Sharpness of the softmax over candidate log-probs.
+        reward_validity_weight: Weight for the valid-SMILES indicator.
+        reward_similarity_weight: Weight for the main similarity signal.
+        reward_exact_match_weight: Weight for the exact-match indicator.
         reward_mode: ``'tanimoto'``, ``'edit_distance'``, or ``'visual'``.
-        frozen_encoder: Frozen encoder for stable visual reward.
-        frozen_pos_enc: Frozen pos_enc_2d for stable visual reward.
-        visual_reward_renderer: Visual render backend for reward images.
-            One of ``'rdkit'`` or ``'drawing_engine'``.
+        frozen_encoder: Frozen image encoder for stable visual reward
+            (only used when ``reward_mode='visual'`` without an external
+            encoder).
+        frozen_pos_enc: Frozen positional encoding paired with
+            *frozen_encoder*.
+        visual_reward_encoder: External SiameseNetwork encoder for visual
+            reward.  When provided, *frozen_encoder* is not used.
+        visual_reward_transforms: Albumentations pipeline for the external
+            encoder's expected input format.
+        visual_reward_pad_to_square: Pad-to-square transform matching the
+            external encoder's training preprocessing.
+        visual_reward_renderer: Render backend for reward images —
+            ``'rdkit'`` (~5 ms/call) or ``'drawing_engine'`` (slower but
+            closer to MolDiscriminator training domain).
+        use_amp: Run the teacher-forced decoder forward pass under AMP
+            fp16 autocast, reducing memory and improving throughput.
 
     Returns:
         loss: Scalar MRT loss with gradient graph.
-        info: Dict with diagnostic metrics.
+        info: Dict of diagnostic metrics (mean_reward, mean_cost,
+            mean_log_prob, exact_matches, valid_smiles_count, etc.).
     """
     B = img_features.size(0)
     total_seqs = B * n_samples
 
-    # Replicate features and GT SMILES for N samples per image
+    # Replicate encoder features for N samples per image: [B, ...] → [B*N, ...]
     img_features_expanded = img_features.repeat_interleave(n_samples, dim=0)
+    # Raw GT SMILES expanded for reward modes that need the original form (e.g. tanimoto)
     gt_expanded = [s for s in gt_smiles_list for _ in range(n_samples)]
 
     # ===== Phase 1: Sample N candidate sequences (no grad) =====
@@ -3937,59 +4033,37 @@ def compute_mrt_loss(
         )
 
     # ===== Phase 2: Compute rewards → costs (non-differentiable) =====
-    # Canonicalize GT SMILES for validity and similarity metrics
+
+    # Canonicalize GT once for B unique images, then expand for B*N comparisons
     gt_canonical = []
-    for s in gt_expanded:
+    for s in gt_smiles_list:
         gt_canonical.append(canonicalize_smiles(s, ignore_cistrans=True)[0])
+    gt_canonical_expanded = [c for c in gt_canonical for _ in range(n_samples)]
 
-    # Extract predicted SMILES (with bond prediction + postprocess)
-    # sampled_smiles = []
-    # with torch.no_grad():
-    #     for b in range(total_seqs):
-    #         result = vocab.sequence_to_smiles(sampled_seqs_list[b])
-    #         try:
-    #             seq_tensor = torch.tensor([sampled_seqs_list[b]], dtype=torch.long, device=device)
-    #             atom_idx, atom_cnt = extract_atom_indices_from_tokens(seq_tensor, vocab)
-    #             a_mask = torch.arange(atom_idx.size(1), device=device) < atom_cnt.unsqueeze(1)
-    #             feat_b = img_features_expanded[b:b+1]
-    #             hidden, _ = model.sequence_decoder(feat_b, seq_tensor)
-    #             e_logits = model.bond_predictor(hidden, atom_idx, a_mask)
-    #             result['bond_mat'] = _symmetrize_edge_predictions(e_logits[0])
-    #         except Exception:
-    #             pass
-    #         pred_smiles = _result_to_smiles_postprocess(result)
-    #         if pred_smiles is None:
-    #             pred_smiles = ''
-    #         sampled_smiles.append(pred_smiles)
-
-    # Extract raw decoder SMILES
+    # Detokenise sampled sequences → raw SMILES strings
     sampled_smiles = []
     with torch.no_grad():
         for b in range(total_seqs):
             result = vocab.sequence_to_smiles(sampled_seqs_list[b])
             sampled_smiles.append(result['smiles'])
 
-    # Canonicalize sampled SMILES for validity and similarity metrics
-    sampled_smiles_canonical = []
-    is_valid_list = []
-    n_valid_smiles = 0
-    for s in sampled_smiles:
-        can, is_valid = canonicalize_smiles(s, ignore_cistrans=True)
-        sampled_smiles_canonical.append(can)
-        is_valid_list.append(is_valid)
-        if is_valid:
-            n_valid_smiles += 1
+    # Canonicalize sampled SMILES in parallel (RDKit is CPU-bound)
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as pool:
+        canon_results = list(pool.map(
+            lambda s: canonicalize_smiles(s, ignore_cistrans=True),
+            sampled_smiles
+        ))
+    sampled_smiles_canonical = [r[0] for r in canon_results]
+    is_valid_list = [r[1] for r in canon_results]
+    n_valid_smiles = sum(is_valid_list)
 
-    if device.type == 'cuda':
-        torch.cuda.empty_cache()
-
-    # Per-sample validity and exact match
+    # Per-sample exact match (canonical pred == canonical GT)
     is_exact_list = []
-
     n_exact = 0
     for b in range(total_seqs):
         # Use canonicalized SMILES for exact match to avoid penalizing minor token reordering that doesn't affect the molecule.
-        is_exact = sampled_smiles_canonical[b] != '' and sampled_smiles_canonical[b] == gt_canonical[b]
+        is_exact = sampled_smiles_canonical[b] != '' and sampled_smiles_canonical[b] == gt_canonical_expanded[b]
         is_exact_list.append(is_exact)
         if is_exact:
             n_exact += 1
@@ -4000,7 +4074,9 @@ def compute_mrt_loss(
     extra_info: Dict = {}
 
     if reward_mode == 'tanimoto':
-        # Tominoto similarity is based on fingerprints, so SMILES strings must be legal. 
+        # Tanimoto similarity uses Morgan fingerprints, so SMILES must parse into a valid molecule.
+        # Re-prepare both GT and predictions via _prepare_smiles_for_tanimoto, which returns ''
+        # for unparseable strings.  Validity/exact-match are re-derived from the fingerprint form.
         gt_tanimoto = [_prepare_smiles_for_tanimoto(s) for s in gt_expanded]
         pred_tanimoto = [_prepare_smiles_for_tanimoto(s) for s in sampled_smiles]
 
@@ -4029,9 +4105,10 @@ def compute_mrt_loss(
         extra_info['mean_tanimoto'] = similarity_sum / max(total_seqs, 1)
 
     elif reward_mode == 'edit_distance':
+        # Normalised Levenshtein on canonicalized forms so that semantically
+        # identical SMILES with different token order aren't penalised.
         for b in range(total_seqs):
-            # Canonicalize to make sure that the order of tokens is consistent.
-            edit_sim = _levenshtein_similarity(sampled_smiles_canonical[b], gt_canonical[b])
+            edit_sim = _levenshtein_similarity(sampled_smiles_canonical[b], gt_canonical_expanded[b])
             r = (reward_validity_weight * float(is_valid_list[b])
                  + reward_similarity_weight * edit_sim
                  + reward_exact_match_weight * float(is_exact_list[b]))
@@ -4040,31 +4117,42 @@ def compute_mrt_loss(
         extra_info['mean_edit_similarity'] = similarity_sum / max(total_seqs, 1)
 
     elif reward_mode == 'visual':
+        # Cycle-consistency reward: render pred & GT → encode → cosine similarity.
+        #
+        # Speed optimisations applied here:
+        #   1. GT rendered/encoded only B times (unique images), then expanded.
+        #   2. All rendering (GT + pred) runs via ThreadPoolExecutor.
         _use_external = (visual_reward_encoder is not None)
         _encode_chunk = 32
 
-        gt_rendered_np = []
-        # No need to canonicalize GT SMILES for visual reward.
-        for smi in gt_expanded:
-            img_np, _ = _render_smiles_for_visual_reward(smi, visual_reward_renderer)
-            gt_rendered_np.append(img_np)
+        # --- Parallel SMILES rendering via ThreadPoolExecutor ---
+        from concurrent.futures import ThreadPoolExecutor
+        _render_fn = partial(_render_smiles_for_visual_reward, renderer_mode=visual_reward_renderer)
+        _n_render_workers = min(8, os.cpu_count() or 4)
 
-        pred_rendered_np = []
-        pred_render_ok = []
-        render_success_count = 0
-         # No need to canonicalize GT SMILES for visual reward.
-        for smi in sampled_smiles:
-            img_np, ok = _render_smiles_for_visual_reward(smi, visual_reward_renderer)
-            pred_rendered_np.append(img_np)
-            pred_render_ok.append(bool(ok))
-            if ok:
-                render_success_count += 1
+        # Render B unique GT SMILES (not B*N duplicates — big saving for N=16+)
+        with ThreadPoolExecutor(max_workers=_n_render_workers) as pool:
+            gt_unique_rendered = list(pool.map(_render_fn, gt_smiles_list))
+        # gt_unique_rendered: list of (img_np, ok) tuples, length B
+
+        # Render B*N predicted SMILES in parallel
+        with ThreadPoolExecutor(max_workers=_n_render_workers) as pool:
+            pred_rendered_results = list(pool.map(_render_fn, sampled_smiles))
+
+        pred_rendered_np = [r[0] for r in pred_rendered_results]
+        pred_render_ok = [bool(r[1]) for r in pred_rendered_results]
+        render_success_count = sum(pred_render_ok)
 
         if _use_external:
-            gt_feat = _encode_with_external_encoder(
-                gt_rendered_np, visual_reward_encoder,
+            # Encode B unique GT images → repeat_interleave to B*N features
+            gt_unique_np = [r[0] for r in gt_unique_rendered]
+            gt_feat_unique = _encode_with_external_encoder(
+                gt_unique_np, visual_reward_encoder,
                 visual_reward_transforms, visual_reward_pad_to_square,
                 device, _encode_chunk)
+            gt_feat = gt_feat_unique.repeat_interleave(n_samples, dim=0)
+            del gt_feat_unique
+
             pred_feat = _encode_with_external_encoder(
                 pred_rendered_np, visual_reward_encoder,
                 visual_reward_transforms, visual_reward_pad_to_square,
@@ -4073,18 +4161,20 @@ def compute_mrt_loss(
             _ref_encoder = frozen_encoder if frozen_encoder is not None else model.image_encoder
             _ref_pos_enc = frozen_pos_enc if frozen_pos_enc is not None else model.pos_enc_2d
 
-            gt_rendered_tensors = [model.inference_transforms(image=img)['image'] for img in gt_rendered_np]
-            gt_rendered_batch = torch.stack(gt_rendered_tensors).to(device)
+            # Encode B unique GT images with frozen backbone, then expand to B*N
+            gt_unique_tensors = [model.inference_transforms(image=img)['image'] for img in [r[0] for r in gt_unique_rendered]]
+            gt_unique_batch = torch.stack(gt_unique_tensors).to(device)
             gt_feat_chunks = []
             with torch.no_grad():
-                for i in range(0, total_seqs, _encode_chunk):
-                    chunk = gt_rendered_batch[i:i + _encode_chunk]
+                for i in range(0, B, _encode_chunk):
+                    chunk = gt_unique_batch[i:i + _encode_chunk]
                     feat = _ref_encoder(chunk)
                     feat = _ref_pos_enc(feat)
                     feat = feat.float().mean(dim=[2, 3])
                     gt_feat_chunks.append(feat)
-            gt_feat = torch.cat(gt_feat_chunks, dim=0)
-            del gt_rendered_batch
+            gt_feat_unique = torch.cat(gt_feat_chunks, dim=0)
+            gt_feat = gt_feat_unique.repeat_interleave(n_samples, dim=0)
+            del gt_unique_batch, gt_feat_unique
 
             pred_rendered_tensors = [model.inference_transforms(image=img)['image'] for img in pred_rendered_np]
             pred_rendered_batch = torch.stack(pred_rendered_tensors).to(device)
@@ -4099,7 +4189,9 @@ def compute_mrt_loss(
             pred_feat = torch.cat(pred_feat_chunks, dim=0)
             del pred_rendered_batch
 
+        # Cosine similarity between GT and predicted embeddings [B*N]
         cos_sims = F.cosine_similarity(gt_feat, pred_feat, dim=1).clamp(min=0.0, max=1.0)
+        # Only count visual similarity for samples that are both chemically valid and rendered successfully
         valid_visual_mask = [bool(is_valid_list[b]) and pred_render_ok[b] for b in range(total_seqs)]
         for b in range(total_seqs):
             visual_sim = cos_sims[b].item() if valid_visual_mask[b] else 0.0
@@ -4119,35 +4211,39 @@ def compute_mrt_loss(
     costs = (1.0 - rewards).detach()  # [B * N]
 
     # ===== Phase 3: Teacher-forced forward pass → log p(y_i | x) =====
+    # Pad all B*N sampled sequences to the same length for batched decoder forward.
     max_seq_len = max(len(s) for s in sampled_seqs_list)
     padded_seqs = torch.full((total_seqs, max_seq_len), vocab.pad_idx,
                              dtype=torch.long, device=device)
     for b, seq in enumerate(sampled_seqs_list):
         padded_seqs[b, :len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
 
-    tf_input = padded_seqs[:, :-1]
-    tf_target = padded_seqs[:, 1:]
+    tf_input = padded_seqs[:, :-1]    # decoder input  (shift right)
+    tf_target = padded_seqs[:, 1:]     # target for log-prob gathering
 
-    # Differentiable forward pass
-    _hidden, tf_logits = model.sequence_decoder(img_features_expanded, tf_input)
+    # Differentiable decoder forward. AMP fp16 speeds up the B*N × T matmuls;
+    # logits are cast back to fp32 before log_softmax for numerical stability.
+    _amp_enabled = use_amp and device.type == 'cuda'
+    with torch.amp.autocast('cuda', enabled=_amp_enabled):
+        _hidden, tf_logits = model.sequence_decoder(img_features_expanded, tf_input)
 
-    # Per-token log probabilities
+    tf_logits = tf_logits.float()
     log_probs = F.log_softmax(tf_logits, dim=-1)
     token_log_probs = log_probs.gather(2, tf_target.unsqueeze(-1)).squeeze(-1)
 
     pad_mask = (tf_target != vocab.pad_idx).float()
-    seq_log_probs = (token_log_probs * pad_mask).sum(dim=1)  # [B * N]
+    seq_log_probs = (token_log_probs * pad_mask).sum(dim=1)  # [B*N]
 
     # ===== Phase 4: MRT loss =====
-    # Group by image: [B, N]
+    # Reshape from flat [B*N] to per-image groups [B, N]
     seq_log_probs_grouped = seq_log_probs.view(B, n_samples)
     costs_grouped = costs.view(B, n_samples)
 
-    # Softmax-normalized weights over candidates per image
-    # Gradients flow through seq_log_probs → decoder → encoder
+    # Softmax over N candidates per image: higher-prob samples get more weight.
+    # Gradients flow through seq_log_probs → decoder weights → encoder weights.
     weights = F.softmax(mrt_alpha * seq_log_probs_grouped, dim=1)  # [B, N]
 
-    # Weighted average cost per image, then mean over batch
+    # Per-image expected cost, averaged over the batch
     mrt_loss = (weights * costs_grouped).sum(dim=1).mean()
 
     info = {
@@ -4212,7 +4308,7 @@ def _real_collate_fn(batch):
     return images, smiles
 
 
-def train_rl_real_finetune(
+def train_rl_finetune(
     # ===== Data =====
     train_csv_paths: List[str],
     train_image_dirs: List[str],
@@ -4245,12 +4341,10 @@ def train_rl_real_finetune(
     early_stopping_patience: int = 10,
     num_workers: int = 4,
     use_amp: bool = True,
-    force_cpu: bool = False,
     # ===== RL =====
     rl_max_len: int = 500,
     rl_temperature: float = 0.8,
     rl_n_samples: int = 16,
-    rl_subsample: int = 16,
     reward_validity_weight: float = 0.1,
     reward_similarity_weight: float = 0.5,
     reward_exact_match_weight: float = 0.4,
@@ -4292,19 +4386,17 @@ def train_rl_real_finetune(
     if world_size > 1:
         setup_ddp(local_rank, world_size)
 
-    if force_cpu:
-        device = torch.device('cpu')
-    elif torch.cuda.is_available():
+    if torch.cuda.is_available():
         device = torch.device(f'cuda:{local_rank}')
+        torch.cuda.set_device(device)
     else:
-        device = torch.device('cpu')
+        raise RuntimeError('CUDA is required for RL finetuning')
 
     if is_main_process():
         print(f'=== Real-Image RL Finetuning (cycle consistency) ===')
         print(f'Device: {device}, World size: {world_size}')
         print(f'Train CSVs: {train_csv_paths}')
-        print(f'rl_temperature={rl_temperature}, rl_n_samples={rl_n_samples}, '
-              f'rl_subsample={rl_subsample}')
+        print(f'rl_temperature={rl_temperature}, rl_n_samples={rl_n_samples}')
         print(f'reward weights: validity={reward_validity_weight}, '
               f'similarity={reward_similarity_weight}, '
               f'exact_match={reward_exact_match_weight}')
@@ -4503,7 +4595,6 @@ def train_rl_real_finetune(
             'rl_max_len': rl_max_len,
             'rl_temperature': rl_temperature,
             'rl_n_samples': rl_n_samples,
-            'rl_subsample': rl_subsample,
             'reward_mode': reward_mode,
             'visual_reward_renderer': visual_reward_renderer,
             'reward_validity_weight': reward_validity_weight,
@@ -4560,23 +4651,22 @@ def train_rl_real_finetune(
 
         for images, gt_smiles_batch in pbar:
             images = images.to(device, non_blocking=True)
-            rl_subsample_actual = min(rl_subsample, images.size(0))
 
             optimizer.zero_grad(set_to_none=True)
 
-            # Encode images
-            rl_images = images[:rl_subsample_actual]
-            rl_gt = gt_smiles_batch[:rl_subsample_actual]
+            # Encode images (under autocast when AMP is enabled)
+            with torch.amp.autocast('cuda', enabled=(use_amp and device.type == 'cuda')):
+                img_features = actual_model.image_encoder(images)
+                img_features = actual_model.pos_enc_2d(img_features)
 
-            img_features = actual_model.image_encoder(rl_images)
-            img_features = actual_model.pos_enc_2d(img_features)
-            if use_amp:
-                img_features = img_features.float()
+            # MRT loss runs in fp32 for numerical stability
+            # (softmax over log-probs, cost weighting)
+            img_features = img_features.float()
 
             rl_loss, rl_info = compute_mrt_loss(
                 model=actual_model,
                 img_features=img_features,
-                gt_smiles_list=rl_gt,
+                gt_smiles_list=gt_smiles_batch,
                 vocab=vocab,
                 device=device,
                 max_len=rl_max_len,
@@ -4593,6 +4683,7 @@ def train_rl_real_finetune(
                 visual_reward_transforms=ext_vis_transforms,
                 visual_reward_pad_to_square=ext_vis_pad,
                 visual_reward_renderer=visual_reward_renderer,
+                use_amp=use_amp,
             )
 
             rl_reward = rl_info['mean_reward']
